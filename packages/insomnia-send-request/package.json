@@ -19,7 +19,7 @@
     "httpsnippet": "^1.22.0",
     "insomnia-importers": "2.2.35-beta.3",
     "insomnia-testing": "2.2.35-beta.3",
-    "isomorphic-git": "^1.5.0",
+    "isomorphic-git": "^1.8.2",
     "jshint": "^2.11.1",
     "jsonlint": "^1.6.3",
     "jsonpath": "^1.0.2",
