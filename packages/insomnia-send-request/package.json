@@ -4,7 +4,7 @@
   "version": "2.2.35-beta.3",
   "main": "dist/index.js",
   "dependencies": {
-    "@stoplight/spectral": "^5.4.0",
+    "@stoplight/spectral": "^6.5.0",
     "analytics-node": "^4.0.1",
     "aws4": "^1.10.0",
     "axios": "^0.21.1",
