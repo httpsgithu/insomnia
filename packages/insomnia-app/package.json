@@ -164,7 +164,7 @@
     "objectpath": "^2.0.0",
     "openapi-2-kong": "2.2.35-beta.3",
     "papaparse": "^5.2.0",
-    "pdfjs-dist": "^2.5.207",
+    "pdfjs-dist": "^4.2.67",
     "prop-types": "^15.6.1",
     "react": "^16.8.6",
     "react-animated-tree": "^1.0.10",
