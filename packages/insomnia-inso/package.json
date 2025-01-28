@@ -1,91 +1,56 @@
 {
+  "private": true,
   "name": "insomnia-inso",
-  "version": "2.2.35-beta.3",
+  "version": "10.3.1-beta.0",
   "homepage": "https://insomnia.rest",
-  "description": "A CLI for Insomnia Designer - the collaborative API design tool.",
+  "description": "A CLI for Insomnia - The Collaborative API Design Tool",
   "author": "Kong <office@konghq.com>",
   "license": "Apache-2.0",
-  "repository": "https://github.com/kong/insomnia/tree/develop/packages/insomnia-inso",
-  "bugs": {
-    "url": "https://github.com/kong/insomnia"
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kong/insomnia.git",
+    "directory": "packages/insomnia-inso"
   },
+  "bugs": {
+    "url": "https://github.com/kong/insomnia/issues"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "bin": {
     "inso": "bin/inso"
   },
   "scripts": {
-    "typecheck": "",
-    "test": "jest",
-    "test:watch": "jest --watch",
-    "test:snapshots": "npm run build && jest -u",
-    "build": "webpack --config webpack/webpack.config.development.js --display errors-only",
-    "build:production": "webpack --config webpack/webpack.config.production.js --display errors-only",
-    "start": "npm run build -- --watch",
-    "bootstrap": "npm run build",
-    "prepare": "npm run build:production"
-  },
-  "jest": {
-    "setupFiles": [
-      "./__jest__/setup.js"
-    ],
-    "testMatch": [
-      "**/__tests__/**/*.test.js"
-    ],
-    "verbose": false,
-    "resetMocks": true,
-    "resetModules": true,
-    "collectCoverage": true,
-    "coveragePathIgnorePatterns": [
-      "/node_modules/"
-    ],
-    "coverageThreshold": {
-      "global": {
-        "branches": 90,
-        "functions": 100,
-        "lines": 95,
-        "statements": 95
-      }
-    }
+    "lint": "eslint . --ext .js,.ts,.tsx --cache",
+    "test:unit": "vitest run --exclude '**/cli.test.ts'",
+    "test:bundle": "vitest cli.test.ts -t \"inso dev bundle\"",
+    "test:binary": "vitest cli.test.ts -t \"inso packaged binary\"",
+    "type-check": "tsc --noEmit --project tsconfig.json",
+    "build": "esr esbuild.ts",
+    "build:production": "cross-env NODE_ENV=production esr esbuild.ts",
+    "start": "ESBUILD_WATCH=true esr esbuild.ts",
+    "prepackage": "npm run build:production && rm -rf binaries/inso",
+    "package": "npx -y @yao-pkg/pkg@5.11.5 . --output binaries/inso --targets host",
+    "postpackage": "node src/scripts/verify-pkg.js",
+    "artifacts": "esr src/scripts/artifacts.ts"
   },
   "devDependencies": {
-    "@babel/core": "^7.9.0",
-    "@babel/plugin-proposal-optional-chaining": "^7.9.0",
-    "@babel/preset-env": "^7.10.2",
-    "@babel/preset-flow": "^7.10.1",
-    "execa": "^4.0.2",
-    "flow-bin": "^0.126.1",
-    "get-bin-path": "^5.1.0",
-    "jest": "^26.0.1",
-    "rimraf": "^3.0.2",
-    "webpack": "^4.44.1",
-    "webpack-cli": "^3.3.12",
-    "webpack-merge": "^5.0.7",
-    "webpack-node-externals": "^1.7.2"
+    "cross-env": "^7.0.3",
+    "esbuild": "^0.24.0",
+    "esbuild-runner": "^2.2.2",
+    "vitest": "^2.0.4"
   },
   "dependencies": {
-    "@stoplight/spectral": "^5.4.0",
-    "commander": "^5.1.0",
+    "@seald-io/nedb": "^4.0.4",
+    "@stoplight/spectral-core": "^1.18.3",
+    "@stoplight/spectral-formats": "^1.6.0",
+    "@stoplight/spectral-ruleset-bundler": "^1.5.2",
+    "@stoplight/spectral-rulesets": "^1.18.1",
+    "@stoplight/types": "^14.1.1",
+    "commander": "^12.1.0",
     "consola": "^2.15.0",
-    "cosmiconfig": "^6.0.0",
-    "enquirer": "^2.3.5",
-    "insomnia-plugin-base64": "2.2.35-beta.3",
-    "insomnia-plugin-cookie-jar": "2.2.35-beta.3",
-    "insomnia-plugin-core-themes": "2.2.35-beta.3",
-    "insomnia-plugin-file": "2.2.35-beta.3",
-    "insomnia-plugin-hash": "2.2.35-beta.3",
-    "insomnia-plugin-jsonpath": "2.2.35-beta.3",
-    "insomnia-plugin-now": "2.2.35-beta.3",
-    "insomnia-plugin-os": "2.2.35-beta.3",
-    "insomnia-plugin-prompt": "2.2.35-beta.3",
-    "insomnia-plugin-request": "2.2.35-beta.3",
-    "insomnia-plugin-response": "2.2.35-beta.3",
-    "insomnia-plugin-uuid": "2.2.35-beta.3",
-    "insomnia-send-request": "2.2.35-beta.3",
-    "insomnia-testing": "2.2.35-beta.3",
-    "lodash.flattendeep": "^4.4.0",
-    "mkdirp": "^1.0.4",
-    "nedb": "^1.8.0",
-    "openapi-2-kong": "2.2.35-beta.3",
-    "string-argv": "^0.3.1",
-    "yaml": "^1.10.0"
+    "cosmiconfig": "^9.0.0",
+    "enquirer": "^2.4.1",
+    "string-argv": "^0.3.2",
+    "yaml": "^1.6.0"
   }
 }

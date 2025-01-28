@@ -1,46 +1,65 @@
-name: Test
+name: Test App
 
 on:
+  merge_group:
+  workflow_dispatch:
   push:
     branches:
       - develop
-      - master
   pull_request:
     types:
       - opened
       - synchronize
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  OS:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
+  Test:
+    timeout-minutes: 20
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout branch
-        uses: actions/checkout@v1
-      - name: Read Node version from .nvmrc
-        run: echo "##[set-output name=NVMRC;]$(cat .nvmrc)"
-        id: nvm
-      - uses: actions/setup-node@v1
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: ${{ steps.nvm.outputs.NVMRC }}
-      - name: Bootstrap packages
-        run: npm run bootstrap
-      - name: Run tests
+          node-version-file: ".nvmrc"
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install packages
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Lint markdown
+        run: npm run lint:markdown
+
+      - name: Type checks
+        run: npm run type-check
+
+      - name: Unit Tests
         run: npm test
-      - name: Build for smoke tests
-        run: npm run app-build:smoke
-      - name: Run smoke tests
-        timeout-minutes: 10 # sometimes jest fails to exit - https://github.com/facebook/jest/issues/6423#issuecomment-620407580
-        run: npm run test:smoke:build
-      - name: Upload smoke test screenshots
-        uses: actions/upload-artifact@v2
-        if: always()
+
+      - name: Build app for smoke tests
+        run: NODE_OPTIONS='--max_old_space_size=6144' npm run app-build
+
+      - name: Smoke test electron app
+        run: |
+          GIT_SYNC_SMOKE_TEST_TOKEN=${{env.GIT_SYNC_SMOKE_TEST_TOKEN}} \
+          npm run test:build -w packages/insomnia-smoke-test -- --project=Smoke
+        env:
+          GIT_SYNC_SMOKE_TEST_TOKEN: ${{ secrets.GIT_SYNC_SMOKE_TEST_TOKEN }}
+
+      # This step should always run even when previous steps fail
+      - name: Upload smoke test traces
+        uses: actions/upload-artifact@v4
+        if: failure()
         with:
           if-no-files-found: ignore
-          name: ${{ matrix.os }}-smoke-test-screenshots-${{ github.run_number }}
-          path: packages/insomnia-smoke-test/screenshots
-      - name: Run CLI smoke tests
-        run: npm run test:smoke:cli
+          name: ubuntu-smoke-test-traces-${{ github.run_number }}
+          path: packages/insomnia-smoke-test/traces
