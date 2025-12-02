@@ -126,7 +126,7 @@
     "iconv-lite": "^0.4.15",
     "insomnia-components": "2.2.35-beta.3",
     "insomnia-cookies": "2.2.35-beta.3",
-    "insomnia-importers": "2.2.35-beta.3",
+    "insomnia-importers": "2.8.0",
     "insomnia-plugin-base64": "2.2.35-beta.3",
     "insomnia-plugin-cookie-jar": "2.2.35-beta.3",
     "insomnia-plugin-core-themes": "2.2.35-beta.3",
