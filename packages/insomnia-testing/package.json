@@ -21,7 +21,7 @@
     "resetModules": true
   },
   "devDependencies": {
-    "@babel/core": "^7.9.0",
+    "@babel/core": "^7.29.6",
     "@babel/plugin-proposal-optional-chaining": "^7.9.0",
     "jest": "^26.0.1",
     "webpack": "^4.42.1",
