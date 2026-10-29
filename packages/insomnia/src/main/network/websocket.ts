@@ -1,0 +1,695 @@
+import fs from 'node:fs';
+import { type IncomingMessage } from 'node:http';
+import path from 'node:path';
+import tls, { type KeyObject, type PxfObject } from 'node:tls';
+
+import electron, { BrowserWindow } from 'electron';
+import { MessageType, parseMessage } from 'graphql-ws';
+import { HttpProxyAgent } from 'http-proxy-agent';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import type {
+  BaseWebSocketRequest,
+  CookieJar,
+  Request,
+  RequestAuthentication,
+  RequestHeader,
+  WebSocketResponse,
+} from 'insomnia-data';
+import { models, services } from 'insomnia-data';
+import { setDefaultProtocol } from 'insomnia-data/common';
+import { v4 as uuidV4 } from 'uuid';
+import { type CloseEvent, type ErrorEvent, type Event, type MessageEvent, WebSocket } from 'ws';
+
+import { REALTIME_EVENTS_CHANNELS } from '~/common/constants';
+import { database } from '~/common/database';
+import { getConfidentialBasicAuthHeaderValue } from '~/common/network/sensitive-value-collector';
+import type { RenderedRequest } from '~/common/templating/types';
+import { parseGraphQLReqeustBody } from '~/common/utils/graph-ql';
+import { invariant } from '~/common/utils/invariant';
+import { buildQueryStringFromParams, joinUrlAndQueryString } from '~/common/utils/url/querystring';
+
+import { version } from '../../../package.json';
+import { jarFromCookies } from '../../common/cookies';
+import { generateId, getSetCookieHeaders } from '../../common/misc';
+import { COOKIE, HEADER, QUERY_PARAMS } from '../../network/api-key/constants';
+import { getBasicAuthHeader } from '../../network/basic-auth/get-header';
+import { getBearerAuthHeader } from '../../network/bearer-auth/get-header';
+import { addSetCookiesToToughCookieJar } from '../../network/set-cookie-util';
+import { ipcMainHandle, ipcMainOn } from '../ipc/electron';
+import { insecureReadFile, secureReadFile } from '../secure-read-file';
+import { createSensitiveValuesRegistry } from './sensitive-values-registry';
+
+export interface WebSocketConnection extends WebSocket {
+  _id: string;
+  requestId: string;
+}
+
+export type WebSocketOpenEvent = Omit<Event, 'target'> & {
+  _id: string;
+  requestId: string;
+  type: 'open';
+  timestamp: number;
+};
+
+export type WebSocketMessageEvent = Omit<MessageEvent, 'target'> & {
+  _id: string;
+  requestId: string;
+  direction: 'OUTGOING' | 'INCOMING';
+  type: 'message';
+  timestamp: number;
+};
+
+export type WebSocketErrorEvent = Omit<ErrorEvent, 'target'> & {
+  _id: string;
+  requestId: string;
+  type: 'error';
+  timestamp: number;
+};
+
+export type WebSocketCloseEvent = Omit<CloseEvent, 'target'> & {
+  _id: string;
+  requestId: string;
+  type: 'close';
+  timestamp: number;
+};
+
+export type WebSocketEvent = WebSocketOpenEvent | WebSocketMessageEvent | WebSocketErrorEvent | WebSocketCloseEvent;
+
+export type WebSocketEventLog = WebSocketEvent[];
+
+const protocolName = 'webSocket';
+const WebSocketConnections = new Map<string, WebSocket>();
+const requestIdToResponseIdMap = new Map<string, string>();
+const eventLogFileStreams = new Map<string, fs.WriteStream>();
+const timelineFileStreams = new Map<string, fs.WriteStream>();
+// Confidential values to redact from timeline/event-log writes before they reach disk.
+// Only grows for the lifetime of a connection (each open/send IPC call merges in more
+// values); cleaned up in deleteRequestMaps.
+const sensitiveValues = createSensitiveValuesRegistry();
+
+const writeTimelineEntry = (requestId: string, entry: { value: string; name: string; timestamp: number }) => {
+  timelineFileStreams
+    .get(requestId)
+    ?.write(JSON.stringify({ ...entry, value: sensitiveValues.redactText(requestId, entry.value) }) + '\n');
+};
+
+const writeWsEventLog = (requestId: string, event: WebSocketEvent, opts: { clearRequestIdMap?: boolean } = {}) => {
+  const redactedEvent = sensitiveValues.redactEvent(requestId, event);
+  writeEventLogAndNotify({
+    requestId,
+    data: JSON.stringify(redactedEvent) + '\n',
+    clearRequestIdMap: opts.clearRequestIdMap,
+  });
+};
+
+const getEventNotificationChannel = (responseId: string) =>
+  `${protocolName}.${responseId}.${REALTIME_EVENTS_CHANNELS.NEW_EVENT}`;
+
+const sendToOpenWindows = (channel: string, ...args: unknown[]) => {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.isDestroyed() || window.webContents.isDestroyed()) {
+      continue;
+    }
+    window.webContents.send(channel, ...args);
+  }
+};
+
+const writeEventLogAndNotify = ({
+  requestId,
+  data,
+  clearRequestIdMap = false,
+}: {
+  requestId: string;
+  data: any;
+  clearRequestIdMap?: boolean;
+}) => {
+  eventLogFileStreams.get(requestId)?.write(data, () => {
+    const resId = requestIdToResponseIdMap.get(requestId);
+    if (!resId) {
+      return;
+    }
+
+    // notify all renderers of new event has been received
+    const notifyChannel = getEventNotificationChannel(resId);
+    sendToOpenWindows(notifyChannel);
+    if (clearRequestIdMap) {
+      // clean up maps after last event has been written to file
+      requestIdToResponseIdMap.delete(requestId);
+    }
+  });
+};
+
+const parseResponseAndBuildTimeline = (url: string, incomingMessage: IncomingMessage, clientRequestHeaders: string) => {
+  const statusMessage = incomingMessage.statusMessage || '';
+  const statusCode = incomingMessage.statusCode || 0;
+  const httpVersion = incomingMessage.httpVersion;
+  const responseHeaders = Object.entries(incomingMessage.headers).map(([name, value]) => ({
+    name,
+    value: value?.toString() || '',
+  }));
+  const headersIn = responseHeaders.map(({ name, value }) => `${name}: ${value}`).join('\n');
+  const timeline = [
+    { value: `Preparing request to ${url}`, name: 'Text', timestamp: Date.now() },
+    { value: `Current time is ${new Date().toISOString()}`, name: 'Text', timestamp: Date.now() },
+    { value: 'Using HTTP 1.1', name: 'Text', timestamp: Date.now() },
+    { value: clientRequestHeaders, name: 'HeaderOut', timestamp: Date.now() },
+    { value: `HTTP/${httpVersion} ${statusCode} ${statusMessage}`, name: 'HeaderIn', timestamp: Date.now() },
+    { value: headersIn, name: 'HeaderIn', timestamp: Date.now() },
+  ];
+  return { timeline, responseHeaders, statusCode, statusMessage, httpVersion };
+};
+interface OpenWebSocketRequestOptions {
+  requestId: string;
+  workspaceId: string;
+  url: string;
+  headers: RequestHeader[];
+  authentication: RequestAuthentication;
+  cookieJar: CookieJar;
+  initialPayload?: string;
+  isGraphqlSubscriptionRequest?: boolean;
+  suppressUserAgent?: boolean;
+  /** confidential values registered while rendering the connect payload, for timeline/event-log redaction (T10) */
+  sensitiveValues?: string[];
+}
+const openWebSocketConnection = async (
+  _event: Electron.IpcMainInvokeEvent,
+  options: OpenWebSocketRequestOptions,
+): Promise<void> => {
+  const existingConnection = WebSocketConnections.get(options.requestId);
+
+  if (existingConnection) {
+    console.warn('Connection still open to ' + existingConnection.url);
+    return;
+  }
+
+  const request = options.isGraphqlSubscriptionRequest
+    ? await services.request.getById(options.requestId)
+    : await services.webSocketRequest.getById(options.requestId);
+  const responseId = generateId('res');
+  if (!request) {
+    return;
+  }
+
+  const responsesDir = path.join(process.env['INSOMNIA_DATA_PATH'] || electron.app.getPath('userData'), 'responses');
+
+  const responseBodyPath = path.join(responsesDir, uuidV4() + '.response');
+  eventLogFileStreams.set(options.requestId, fs.createWriteStream(responseBodyPath));
+  const timelinePath = path.join(responsesDir, responseId + '.timeline');
+  timelineFileStreams.set(options.requestId, fs.createWriteStream(timelinePath));
+  requestIdToResponseIdMap.set(options.requestId, responseId);
+  sensitiveValues.reset(options.requestId, options.sensitiveValues);
+
+  const workspaceMeta = await services.workspaceMeta.getOrCreateByParentId(options.workspaceId);
+  // fallback to base environment
+  const activeEnvironmentId = workspaceMeta.activeEnvironmentId;
+  const activeEnvironment = activeEnvironmentId && (await services.environment.getById(activeEnvironmentId));
+  const environment = activeEnvironment || (await services.environment.getOrCreateForParentId(options.workspaceId));
+  invariant(environment, 'failed to find environment ' + activeEnvironmentId);
+  const responseEnvironmentId = environment ? environment._id : null;
+
+  const caCert = await services.caCertificate.getByParentId(options.workspaceId);
+  const caCertficatePath = caCert && !caCert.disabled ? caCert.path : null;
+  // attempt to read CA Certificate PEM from disk, fallback to root certificates
+  // allow to read the file as it is chosen by user
+  const caCertificate =
+    (caCertficatePath && (await insecureReadFile(caCertficatePath))) || tls.rootCertificates.join('\n');
+
+  try {
+    if (!options.url) {
+      throw new Error('URL is required');
+    }
+    const readyStateChannel = `${protocolName}.${request._id}.${REALTIME_EVENTS_CHANNELS.READY_STATE}`;
+
+    const reduceArrayToLowerCaseKeyedDictionary = (
+      acc: Record<string, string>,
+      { name, value }: BaseWebSocketRequest['headers'][0],
+    ) => ({ ...acc, [name.toLowerCase() || '']: value || '' });
+    const headers = options.headers;
+    let url = options.url;
+    let authCookie = null;
+    const settings = await services.settings.get();
+    if (!options.authentication.disabled) {
+      if (options.authentication.type === 'basic') {
+        const { username, password, useISO88591 } = options.authentication;
+        const encoding = useISO88591 ? 'latin1' : 'utf8';
+        const basicAuthHeader = getBasicAuthHeader(username, password, encoding);
+        headers.push(basicAuthHeader);
+        const registeredValues = sensitiveValues.getValues(options.requestId);
+        const confidentialHeaderValue = getConfidentialBasicAuthHeaderValue(registeredValues, options.authentication);
+        if (confidentialHeaderValue) {
+          sensitiveValues.register(options.requestId, [confidentialHeaderValue]);
+        }
+      }
+      if (options.authentication.type === 'apikey') {
+        const { key = '', value = '', addTo } = options.authentication; // Ensure key is not undefined
+        if (addTo === HEADER) {
+          headers.push({ name: key, value: value });
+        } else if (addTo === COOKIE) {
+          authCookie = `${key}=${value}`;
+        } else if (addTo === QUERY_PARAMS) {
+          const authQueryParam = {
+            name: key,
+            value: value,
+          };
+          const qs = authQueryParam ? buildQueryStringFromParams([authQueryParam]) : '';
+          url = joinUrlAndQueryString(options.url, qs);
+        }
+      }
+      if (options.authentication.type === 'bearer' && options.authentication.token) {
+        const { token, prefix } = options.authentication;
+        headers.push(getBearerAuthHeader(token, prefix));
+      }
+    }
+
+    const hasUserAgentHeader = headers.some(({ name }) => name?.toLowerCase() === 'user-agent');
+    const lowerCasedEnabledHeaders = headers
+      .filter(({ name, disabled }) => Boolean(name) && !disabled)
+      .reduce(reduceArrayToLowerCaseKeyedDictionary, {});
+    if (!options.suppressUserAgent && !request.disableUserAgentHeader && !hasUserAgentHeader) {
+      lowerCasedEnabledHeaders['user-agent'] = `insomnia/${version}`;
+    }
+    const start = performance.now();
+
+    const clientCertificates = await services.clientCertificate.findByParentId(options.workspaceId);
+    const filteredClientCertificates = models.clientCertificate.filterClientCertificates(
+      clientCertificates,
+      options.url,
+      'wss:',
+    );
+    const pemCertificates: string[] = [];
+    const pemCertificateKeys: KeyObject[] = [];
+    const pfxCertificates: PxfObject[] = [];
+
+    filteredClientCertificates.forEach(clientCertificate => {
+      const { passphrase, cert, key, pfx } = clientCertificate;
+
+      if (cert) {
+        writeTimelineEntry(options.requestId, {
+          value: `Adding SSL PEM certificate: ${cert}`,
+          name: 'Text',
+          timestamp: Date.now(),
+        });
+        pemCertificates.push(fs.readFileSync(cert, 'utf8'));
+      }
+
+      if (key) {
+        writeTimelineEntry(options.requestId, {
+          value: `Adding SSL KEY certificate: ${key}`,
+          name: 'Text',
+          timestamp: Date.now(),
+        });
+        pemCertificateKeys.push({ pem: fs.readFileSync(key, 'utf8'), passphrase: passphrase ?? undefined });
+      }
+
+      if (pfx) {
+        writeTimelineEntry(options.requestId, {
+          value: `Adding SSL P12 certificate: ${pfx}`,
+          name: 'Text',
+          timestamp: Date.now(),
+        });
+        pfxCertificates.push({ buf: fs.readFileSync(pfx, 'utf8'), passphrase: passphrase ?? undefined });
+      }
+    });
+
+    if (request.settingSendCookies && options.cookieJar.cookies.length) {
+      const jar = jarFromCookies(options.cookieJar.cookies);
+      const cookieHeader = jar.getCookieStringSync(options.url);
+      const cookieHeaderWithAuth = cookieHeader ? `${cookieHeader};${authCookie ?? ''}` : `${authCookie};`;
+      if (cookieHeaderWithAuth) {
+        lowerCasedEnabledHeaders['cookie'] = cookieHeaderWithAuth;
+      }
+    }
+
+    const followRedirects =
+      {
+        off: false,
+        on: true,
+        global: settings.followRedirects,
+      }[request.settingFollowRedirects] ?? true;
+    const protocols = lowerCasedEnabledHeaders['sec-websocket-protocol']?.split(',').map(p => p.trim());
+    const shouldUseProxy =
+      settings.proxyEnabled && models.webSocketRequest.isWebSocketRequest(request) && request.settingUseProxy;
+    const ws = new WebSocket(url, protocols, {
+      headers: lowerCasedEnabledHeaders,
+      ca: caCertificate,
+      cert: pemCertificates,
+      key: pemCertificateKeys,
+      pfx: pfxCertificates,
+      rejectUnauthorized: settings.validateSSL,
+      followRedirects,
+      maxRedirects: settings.maxRedirects > 0 ? settings.maxRedirects : undefined,
+      // apply proxy settings
+      ...(shouldUseProxy && {
+        agent: getProxyAgent(url, settings.httpProxy, settings.httpsProxy),
+      }),
+    });
+    WebSocketConnections.set(options.requestId, ws);
+
+    ws.on('upgrade', async incomingMessage => {
+      // @ts-expect-error -- private property
+      const internalRequestHeader = ws._req._header;
+      const { timeline, responseHeaders, statusCode, statusMessage, httpVersion } = parseResponseAndBuildTimeline(
+        url,
+        incomingMessage,
+        internalRequestHeader,
+      );
+      const responsePatch: Partial<WebSocketResponse> = {
+        _id: responseId,
+        parentId: request._id,
+        environmentId: responseEnvironmentId,
+        headers: responseHeaders,
+        url: sensitiveValues.redactText(options.requestId, url),
+        statusCode,
+        statusMessage,
+        httpVersion,
+        elapsedTime: performance.now() - start,
+        timelinePath,
+        eventLogPath: responseBodyPath,
+        settingSendCookies: request.settingSendCookies,
+        settingStoreCookies: request.settingStoreCookies,
+      };
+
+      const settings = await services.settings.get();
+      const res = await services.webSocketResponse.create(responsePatch, settings.maxHistoryResponses);
+      services.requestMeta.updateOrCreateByParentId(request._id, { activeResponseId: res._id });
+
+      if (request.settingStoreCookies) {
+        const setCookieStrings: string[] = getSetCookieHeaders(responseHeaders).map(h => h.value);
+        const totalSetCookies = setCookieStrings.length;
+        if (totalSetCookies) {
+          const currentUrl = request.url;
+          const { cookies, rejectedCookies } = await addSetCookiesToToughCookieJar({
+            setCookieStrings,
+            currentUrl,
+            cookieJar: options.cookieJar,
+          });
+          rejectedCookies.forEach(errorMessage =>
+            timeline.push({ value: `Rejected cookie: ${errorMessage}`, name: 'Text', timestamp: Date.now() }),
+          );
+          const hasCookiesToPersist = totalSetCookies > rejectedCookies.length;
+          if (hasCookiesToPersist) {
+            await services.cookieJar.update(options.cookieJar, { cookies });
+            timeline.push({ value: `Saved ${totalSetCookies} cookies`, name: 'Text', timestamp: Date.now() });
+          }
+        }
+      }
+
+      timeline.forEach(t => writeTimelineEntry(options.requestId, t));
+    });
+    ws.on('unexpected-response', async (clientRequest, incomingMessage) => {
+      incomingMessage.on('data', chunk => {
+        writeTimelineEntry(options.requestId, { value: chunk.toString(), name: 'DataOut', timestamp: Date.now() });
+      });
+      // @ts-expect-error -- private property
+      const internalRequestHeader = clientRequest._header;
+      const { timeline, responseHeaders, statusCode, statusMessage, httpVersion } = parseResponseAndBuildTimeline(
+        url,
+        incomingMessage,
+        internalRequestHeader,
+      );
+      timeline.forEach(t => writeTimelineEntry(options.requestId, t));
+      const responsePatch: Partial<WebSocketResponse> = {
+        _id: responseId,
+        parentId: request._id,
+        environmentId: responseEnvironmentId,
+        headers: responseHeaders,
+        url: sensitiveValues.redactText(options.requestId, url),
+        statusCode,
+        statusMessage,
+        httpVersion,
+        elapsedTime: performance.now() - start,
+        timelinePath,
+        eventLogPath: responseBodyPath,
+        settingSendCookies: request.settingSendCookies,
+        settingStoreCookies: request.settingStoreCookies,
+      };
+      const settings = await services.settings.get();
+      const res = await services.webSocketResponse.create(responsePatch, settings.maxHistoryResponses);
+      services.requestMeta.updateOrCreateByParentId(request._id, { activeResponseId: res._id });
+      deleteRequestMaps(request._id, `Unexpected response ${incomingMessage.statusCode}`);
+    });
+
+    ws.addEventListener('open', () => {
+      const openEvent: WebSocketOpenEvent = {
+        _id: uuidV4(),
+        requestId: options.requestId,
+        type: 'open',
+        timestamp: Date.now(),
+      };
+      writeWsEventLog(options.requestId, openEvent);
+      writeTimelineEntry(options.requestId, {
+        value: 'WebSocket connection established',
+        name: 'Text',
+        timestamp: Date.now(),
+      });
+      sendToOpenWindows(readyStateChannel, ws.readyState === WebSocket.OPEN);
+
+      if (options.initialPayload) {
+        sendPayload(ws, { requestId: options.requestId, payload: options.initialPayload });
+      }
+    });
+
+    ws.addEventListener('message', ({ data }: MessageEvent) => {
+      const messageEvent: WebSocketMessageEvent = {
+        _id: uuidV4(),
+        requestId: options.requestId,
+        data,
+        type: 'message',
+        direction: 'INCOMING',
+        timestamp: Date.now(),
+      };
+      writeWsEventLog(options.requestId, messageEvent);
+      // send subscribe operation to graphql websocket server
+      if (options.isGraphqlSubscriptionRequest) {
+        handleGraphQLWsMessage(data, request as Request);
+      }
+    });
+
+    ws.addEventListener('close', ({ code, reason, wasClean }) => {
+      const closeEvent: WebSocketCloseEvent = {
+        _id: uuidV4(),
+        requestId: options.requestId,
+        code,
+        reason,
+        type: 'close',
+        wasClean,
+        timestamp: Date.now(),
+      };
+
+      const message = `Closing connection with code ${code}`;
+      deleteRequestMaps(request._id, message, closeEvent);
+      sendToOpenWindows(readyStateChannel, ws.readyState === WebSocket.OPEN);
+    });
+
+    ws.addEventListener('error', async ({ error, message }: ErrorEvent) => {
+      console.error('Error from remote:', error.code, error);
+
+      const errorEvent: WebSocketErrorEvent = {
+        _id: uuidV4(),
+        requestId: options.requestId,
+        message,
+        type: 'error',
+        error,
+        timestamp: Date.now(),
+      };
+
+      // Redact up front: deleteRequestMaps drops this request's value set below.
+      const redactedMessage = sensitiveValues.redactText(request._id, message || 'Something went wrong');
+      deleteRequestMaps(request._id, message, errorEvent);
+      sendToOpenWindows(readyStateChannel, ws.readyState === WebSocket.OPEN);
+      if (error.code) {
+        createErrorResponse(responseId, request._id, responseEnvironmentId, timelinePath, redactedMessage);
+      }
+    });
+  } catch (e) {
+    console.error('unhandled error:', e);
+
+    // See the comment above: redact before deleteRequestMaps clears the value set.
+    const redactedMessage = sensitiveValues.redactText(request._id, e.message || 'Something went wrong');
+    deleteRequestMaps(request._id, e.message || 'Something went wrong');
+    createErrorResponse(responseId, request._id, responseEnvironmentId, timelinePath, redactedMessage);
+  }
+};
+
+// graphql ws protocol message handler. Refer: https://github.com/enisdenjo/graphql-ws/blob/master/PROTOCOL.md
+const handleGraphQLWsMessage = (data: MessageEvent['data'], request: Request) => {
+  const graphqlServerData = parseMessage(data);
+  const graphqlServerDataType = graphqlServerData.type;
+  const requestId = request._id;
+  // send subscribe operation to graphql websocket server when ack is received
+  if (graphqlServerDataType === MessageType.ConnectionAck) {
+    parseGraphQLReqeustBody(request as RenderedRequest);
+    let subscriptionPayload = {};
+    try {
+      // @ts-expect-error graphql request has body attribute
+      subscriptionPayload = JSON.parse(request.body.text);
+    } catch (error) {
+      console.warn('failed to parse graphql subscription request body', error);
+    }
+    const payload = JSON.stringify({
+      id: uuidV4(),
+      type: MessageType.Subscribe,
+      payload: subscriptionPayload,
+    });
+    sendWebSocketEvent({ payload, requestId });
+  } else if (graphqlServerDataType === MessageType.Error || graphqlServerDataType === MessageType.Complete) {
+    // close connection if server responded with error or complete
+    closeWebSocketConnection({ requestId });
+  }
+};
+
+const createErrorResponse = async (
+  responseId: string,
+  requestId: string,
+  environmentId: string | null,
+  timelinePath: string,
+  // Redacted by the caller: the error paths run deleteRequestMaps first — so a failure here can
+  // never leave the streams and maps behind — and that drops this request's value set.
+  redactedMessage: string,
+) => {
+  const settings = await services.settings.get();
+  const responsePatch = {
+    _id: responseId,
+    parentId: requestId,
+    environmentId: environmentId,
+    timelinePath,
+    statusMessage: 'Error',
+    error: redactedMessage,
+  };
+  const res = await services.webSocketResponse.create(responsePatch, settings.maxHistoryResponses);
+  services.requestMeta.updateOrCreateByParentId(requestId, { activeResponseId: res._id });
+};
+
+const deleteRequestMaps = async (
+  requestId: string,
+  message: string,
+  event?: WebSocketCloseEvent | WebSocketErrorEvent,
+) => {
+  if (event) {
+    writeWsEventLog(requestId, event, { clearRequestIdMap: true });
+  }
+  eventLogFileStreams.get(requestId)?.end();
+  eventLogFileStreams.delete(requestId);
+  writeTimelineEntry(requestId, { value: message, name: 'Text', timestamp: Date.now() });
+  timelineFileStreams.get(requestId)?.end();
+  timelineFileStreams.delete(requestId);
+  WebSocketConnections.delete(requestId);
+  sensitiveValues.clear(requestId);
+};
+
+const getWebSocketReadyState = async (options: { requestId: string }): Promise<boolean> => {
+  return WebSocketConnections.get(options.requestId)?.readyState === WebSocket.OPEN;
+};
+
+const sendPayload = async (ws: WebSocket, options: { payload: string; requestId: string }): Promise<void> => {
+  ws.send(options.payload, error => {
+    // @TODO: We might want to set a status in the WebSocketMessageEvent
+    // and update it here based on the error. e.g. status = 'sending' | 'sent' | 'error'
+    if (error) {
+      console.error(error);
+    } else {
+      console.log('[main] Message sent');
+    }
+  });
+
+  const lastMessage: WebSocketMessageEvent = {
+    _id: uuidV4(),
+    requestId: options.requestId,
+    data: options.payload,
+    direction: 'OUTGOING',
+    type: 'message',
+    timestamp: Date.now(),
+  };
+
+  writeWsEventLog(options.requestId, lastMessage);
+  const response = await database.findOne<WebSocketResponse>(
+    'WebSocketResponse',
+    {
+      parentId: options.requestId,
+    },
+    { modified: -1 },
+  );
+  if (!response) {
+    console.error('something went wrong');
+    return;
+  }
+};
+
+const sendWebSocketEvent = async (options: {
+  payload: string;
+  requestId: string;
+  sensitiveValues?: string[];
+}): Promise<void> => {
+  const ws = WebSocketConnections.get(options.requestId);
+
+  if (!ws) {
+    console.warn('No websocket found for requestId: ' + options.requestId);
+    return;
+  }
+
+  sensitiveValues.register(options.requestId, options.sensitiveValues);
+  sendPayload(ws, options);
+};
+
+const closeWebSocketConnection = (options: { requestId: string }): void => {
+  const ws = WebSocketConnections.get(options.requestId);
+  if (!ws) {
+    return;
+  }
+  ws.close();
+};
+
+const closeAllWebSocketConnections = (): void => WebSocketConnections.forEach(ws => ws.close());
+
+const findMany = async (options: { responseId: string }): Promise<WebSocketEvent[]> => {
+  const response = await services.webSocketResponse.getById(options.responseId);
+  if (!response || !response.eventLogPath) {
+    return [];
+  }
+  const body = await secureReadFile(response.eventLogPath);
+  return (
+    body
+      .split('\n')
+      .filter(e => e?.trim())
+      // Parse the message
+      .map(e => JSON.parse(e))
+      // Reverse the list of messages so that we get the latest message first
+      .reverse() || []
+  );
+};
+
+const getProxyAgent = (url: string, httpProxy: string, httpsProxy: string) => {
+  const useHttpsProxy = url.startsWith('wss:') || url.startsWith('https:');
+  return useHttpsProxy
+    ? new HttpsProxyAgent(setDefaultProtocol(httpsProxy))
+    : new HttpProxyAgent(setDefaultProtocol(httpProxy));
+};
+
+export interface WebSocketBridgeAPI {
+  open: (options: OpenWebSocketRequestOptions) => void;
+  close: typeof closeWebSocketConnection;
+  closeAll: typeof closeAllWebSocketConnections;
+  readyState: {
+    getCurrent: typeof getWebSocketReadyState;
+  };
+  event: {
+    findMany: typeof findMany;
+    send: typeof sendWebSocketEvent;
+  };
+}
+export const registerWebSocketHandlers = () => {
+  ipcMainHandle('webSocket.open', openWebSocketConnection);
+  ipcMainHandle('webSocket.event.send', (_, options: Parameters<typeof sendWebSocketEvent>[0]) =>
+    sendWebSocketEvent(options),
+  );
+  ipcMainOn('webSocket.close', (_, options: Parameters<typeof closeWebSocketConnection>[0]) =>
+    closeWebSocketConnection(options),
+  );
+  ipcMainOn('webSocket.closeAll', closeAllWebSocketConnections);
+  ipcMainHandle('webSocket.readyState', (_, options: Parameters<typeof getWebSocketReadyState>[0]) =>
+    getWebSocketReadyState(options),
+  );
+  ipcMainHandle('webSocket.event.findMany', (_, options: Parameters<typeof findMany>[0]) => findMany(options));
+};
+
+electron.app.on('window-all-closed', closeAllWebSocketConnections);

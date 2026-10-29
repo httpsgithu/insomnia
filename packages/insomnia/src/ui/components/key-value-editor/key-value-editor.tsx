@@ -1,0 +1,662 @@
+import React, { type FC, Fragment, useCallback, useMemo, useRef, useState } from 'react';
+import {
+  Button,
+  DropIndicator,
+  ListBox,
+  ListBoxItem,
+  Menu,
+  MenuItem,
+  MenuTrigger,
+  Popover,
+  ToggleButton,
+  Toolbar,
+  useDragAndDrop,
+} from 'react-aria-components';
+
+import { utf8ByteLength } from '~/common/utils/utf8-bytes';
+import { purgeCachedEditorStates } from '~/ui/components/.client/codemirror/editor-state-cache';
+import { OneLineEditor, type OneLineEditorHandle } from '~/ui/components/.client/codemirror/one-line-editor';
+
+import { describeByteSize, generateId } from '../../../common/misc';
+import { FileInputButton } from '../base/file-input-button';
+import { PromptButton } from '../base/prompt-button';
+import { Icon } from '../icon';
+import { showModal } from '../modals';
+import { CodePromptModal } from '../modals/code-prompt-modal';
+
+interface Pair {
+  id?: string;
+  name: string;
+  value: string;
+  description?: string;
+  fileName?: string;
+  type?: string;
+  disabled?: boolean;
+  multiline?: boolean | string;
+  canDisable?: boolean;
+}
+
+// Id of the row whose Name cell should grab focus after an "Add". Module-level so it survives the
+// KeyValueEditor remount that the async pair save triggers, and so it isn't prematurely consumed under
+// React StrictMode. Keying off the specific id (rather than a shared boolean) means only the newly
+// added row can autofocus — never an unrelated row in another mounted KeyValueEditor. Set on "Add",
+// read during render, and cleared once that exact row's Name editor focuses (via onAutoFocus).
+let pendingFocusLastRowId: string | null = null;
+
+function createEmptyPair() {
+  return {
+    id: generateId('pair'),
+    name: '',
+    value: '',
+    description: '',
+    disabled: false,
+  };
+}
+
+type AutocompleteHandler = (pair: Pair) => string[] | PromiseLike<string[]>;
+
+interface Props {
+  allowFile?: boolean;
+  allowMultiline?: boolean;
+  descriptionPlaceholder?: string;
+  handleGetAutocompleteNameConstants?: AutocompleteHandler;
+  handleGetAutocompleteValueConstants?: AutocompleteHandler;
+  isDisabled?: boolean;
+  namePlaceholder?: string;
+  onChange: (pairs: Pair[]) => void;
+  pairs: Pair[];
+  valuePlaceholder?: string;
+  onBlur?: (e: FocusEvent) => void;
+  readOnlyPairs?: Pair[];
+  readOnlyDisabledByName?: Record<string, boolean>;
+  onReadOnlyDisabledChange?: (name: string, disabled: boolean) => void;
+  onDescriptionToggle?: () => void;
+  // When true, a blank placeholder row is always rendered at the end of the list.
+  // The blank row is purely visual - it is not persisted (so it never shows up in
+  // diffs) until the user starts typing in it, at which point it is committed and a
+  // fresh blank row takes its place.
+  alwaysShowBlankRow?: boolean;
+}
+
+export const KeyValueEditor: FC<Props> = ({
+  allowFile,
+  allowMultiline,
+  descriptionPlaceholder,
+  handleGetAutocompleteNameConstants,
+  handleGetAutocompleteValueConstants,
+  isDisabled,
+  namePlaceholder,
+  onChange,
+  pairs,
+  valuePlaceholder,
+  readOnlyPairs,
+  readOnlyDisabledByName,
+  onReadOnlyDisabledChange,
+  onDescriptionToggle,
+  alwaysShowBlankRow,
+}) => {
+  const [showDescription, setShowDescription] = useState(
+    pairs.some(p => p.description && p.description.trim() !== '') || false,
+  );
+  // The persisted pairs (everything that lives in the data model and shows up in diffs).
+  const persistedItems = useMemo(
+    () => pairs.map(pair => ({ ...pair, id: pair.id || generateId('pair') })),
+    // Ensure same array data will not generate different kvPairs to avoid flash issue
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [JSON.stringify(pairs)],
+  );
+  const blankNameEditorRef = useRef<OneLineEditorHandle>(null);
+  // The id for the trailing blank row is derived from the persisted pairs (rather than
+  // held in state) so it only changes when the data actually changes. This keeps it in
+  // sync with the async data updates - if it flipped eagerly the row the user just typed
+  // into would briefly belong to no list and flicker.
+  // A fresh id is minted only once the previous one is committed (found in persistedItems) -
+  // never reused, even after that row is later deleted. Reclaiming a freed numeric slot would
+  // let a deleted row's id land back on the blank row, and since the row's key (and its
+  // OneLineEditor's key) is derived from that id, React would reuse the deleted row's DOM/editor
+  // instance instead of remounting it - leaving stale, uncommitted text on screen.
+  const blankIdRef = useRef(generateId('pair-blank'));
+  const blankId = useMemo(() => {
+    if (persistedItems.some(item => item.id === blankIdRef.current)) {
+      blankIdRef.current = generateId('pair-blank');
+    }
+    return blankIdRef.current;
+  }, [persistedItems]);
+  const blankPair = useMemo<Pair>(
+    () => ({ id: blankId, name: '', value: '', description: '', disabled: false }),
+    [blankId],
+  );
+  // Render a trailing blank row when asked, or when there is nothing else to show.
+  const pairsListItems = useMemo(
+    () => (alwaysShowBlankRow || persistedItems.length === 0 ? [...persistedItems, blankPair] : persistedItems),
+    [alwaysShowBlankRow, persistedItems, blankPair],
+  );
+  const initialReadOnlyItems = readOnlyPairs?.map(pair => ({ ...pair, id: pair.id || generateId('pair') })) || [];
+
+  const upsertPair = useCallback(
+    function upsertPair(pair: Pair) {
+      const exists = pairsListItems.some(item => item.id === pair.id);
+      const next = exists ? pairsListItems.map(item => (item.id === pair.id ? pair : item)) : [...pairsListItems, pair];
+      // Never persist the trailing blank row while it is still empty, so it stays out of
+      // diffs until the user actually starts filling it in.
+      onChange(
+        next.filter(item => item.id !== blankId || item.name || item.value || item.description || item.fileName),
+      );
+    },
+    [pairsListItems, blankId, onChange],
+  );
+
+  const repositionInArray = (allItems: Pair[], itemsToMove: string[], targetIndex: number) => {
+    const removed = allItems.filter(item => item.id !== itemsToMove[0]);
+    const itemToMove = allItems.find(item => item.id === itemsToMove[0]);
+    if (itemToMove) {
+      return [...removed.slice(0, targetIndex), itemToMove, ...removed.slice(targetIndex)];
+    }
+    return allItems;
+  };
+
+  const { dragAndDropHooks } = useDragAndDrop({
+    getItems: keys =>
+      [...keys].map(key => ({ 'text/plain': `${pairsListItems.find(item => item.id === key.toString())?.id}` })),
+    onReorder(e) {
+      const movedKeys = [...e.keys].map(key => key.toString());
+      // The blank row is not a real pair, so it can't be reordered.
+      if (movedKeys.includes(blankId)) {
+        return;
+      }
+      const targetIndex = persistedItems.findIndex(item => item.id === e.target.key.toString());
+      onChange(repositionInArray(persistedItems, movedKeys, targetIndex === -1 ? persistedItems.length : targetIndex));
+    },
+    renderDragPreview(items) {
+      const pair = pairsListItems.find(item => item.id === items[0]['text/plain']) || createEmptyPair();
+
+      const element = document.querySelector(`[data-key="${pair.id}"]`);
+
+      const isFile = 'type' in pair && pair.type === 'file';
+      const isMultiline = 'type' in pair && pair.type === 'text' && pair.multiline;
+      const bytes = isMultiline ? utf8ByteLength(pair.value) : 0;
+
+      let valueEditor = (
+        <div className="relative flex h-full w-full flex-1 px-2">
+          <OneLineEditor
+            id={'key-value-editor__value' + pair.id}
+            historyKey={'key-value-editor__value' + pair.id}
+            placeholder={valuePlaceholder || 'Value'}
+            defaultValue={pair.value}
+            readOnly
+            getAutocompleteConstants={() => handleGetAutocompleteValueConstants?.(pair) || []}
+            onChange={() => {}}
+          />
+        </div>
+      );
+
+      if (isFile) {
+        valueEditor = (
+          <FileInputButton
+            showFileName
+            showFileIcon
+            disabled
+            className="flex w-full flex-1 items-center justify-center gap-2 overflow-hidden rounded-xs px-2 py-1 text-sm text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) focus:ring-(--hl-md) focus:ring-inset aria-pressed:bg-(--hl-sm)"
+            path={pair.fileName || ''}
+            onChange={() => {}}
+          />
+        );
+      }
+
+      if (isMultiline) {
+        valueEditor = (
+          <Button
+            isDisabled
+            className="flex w-full flex-1 items-center justify-center gap-2 overflow-hidden rounded-xs px-2 py-1 text-sm text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) focus:ring-(--hl-md) focus:ring-inset aria-pressed:bg-(--hl-sm)"
+          >
+            <i className="fa fa-pencil-square-o space-right" />
+            {bytes > 0 ? describeByteSize(bytes, true) : 'Click to Edit'}
+          </Button>
+        );
+      }
+
+      return (
+        <div
+          className="flex h-(--line-height-sm) shrink-0 items-center gap-2 bg-(--color-bg) px-2 outline-hidden"
+          style={{
+            width: element?.clientWidth,
+          }}
+        >
+          <div
+            slot="drag"
+            className="invisible flex w-5 shrink-0 cursor-grab items-center justify-center p-2 focus-visible:bg-(--hl-sm)"
+          >
+            <Icon icon="grip-vertical" className="w-2 text-(--hl)" />
+          </div>
+          <div className="relative flex h-full w-full flex-1 px-2">
+            <OneLineEditor
+              id={'key-value-editor__name' + pair.id}
+              historyKey={'key-value-editor__name' + pair.id}
+              placeholder={namePlaceholder || 'Name'}
+              defaultValue={pair.name}
+              readOnly
+              onChange={() => {}}
+            />
+          </div>
+          {valueEditor}
+          {showDescription && (
+            <div className="relative flex h-full w-full flex-1 px-2">
+              <OneLineEditor
+                id={'key-value-editor__description' + pair.id}
+                historyKey={'key-value-editor__description' + pair.id}
+                placeholder={descriptionPlaceholder || 'Description'}
+                defaultValue={pair.description || ''}
+                readOnly
+                onChange={() => {}}
+              />
+            </div>
+          )}
+          <div className="flex w-23 shrink-0 items-center gap-2" />
+        </div>
+      );
+    },
+    renderDropIndicator(target) {
+      return (
+        <DropIndicator
+          target={target}
+          className="z-10 outline-1 outline-solid data-drop-target:outline-(--color-surprise)"
+        />
+      );
+    },
+  });
+
+  return (
+    <Fragment>
+      <Toolbar className="content-box sticky top-0 z-10 flex h-(--line-height-sm) shrink-0 border-b border-(--hl-md) bg-(--color-bg) text-(--font-size-sm)">
+        <Button
+          className="flex h-full items-center justify-center gap-2 px-4 py-1 text-xs text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) focus:ring-(--hl-md) focus:ring-inset aria-pressed:bg-(--hl-sm)"
+          onPress={() => {
+            const id = generateId('pair');
+            pendingFocusLastRowId = id;
+            upsertPair({ id, name: '', value: '', description: '', disabled: false });
+          }}
+        >
+          <Icon icon="plus" /> Add
+        </Button>
+        <PromptButton
+          disabled={persistedItems.length === 0}
+          onClick={() => {
+            onChange([]);
+          }}
+          className="flex h-full items-center justify-center gap-2 px-4 py-1 text-xs text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) focus:ring-(--hl-md) focus:ring-inset aria-pressed:bg-(--hl-sm)"
+        >
+          <Icon icon="trash-can" />
+          <span>Delete all</span>
+        </PromptButton>
+        <ToggleButton
+          className="flex h-full items-center justify-center gap-2 px-4 py-1 text-xs text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) focus:ring-(--hl-md) focus:ring-inset"
+          onChange={value => {
+            setShowDescription(value);
+            onDescriptionToggle?.();
+          }}
+          isSelected={showDescription}
+        >
+          {({ isSelected }) => (
+            <>
+              <Icon
+                className={isSelected ? 'text-(--color-success)' : ''}
+                icon={isSelected ? 'toggle-on' : 'toggle-off'}
+              />
+              <span>Description</span>
+            </>
+          )}
+        </ToggleButton>
+      </Toolbar>
+      {initialReadOnlyItems.length > 0 && (
+        <ListBox
+          aria-label="Key-value pairs readonly"
+          selectionMode="none"
+          disallowTypeAhead
+          dependencies={[showDescription]}
+          className="relative flex w-full flex-1 flex-col overflow-y-auto pt-1"
+          items={initialReadOnlyItems}
+        >
+          {pair => {
+            const isFile = pair.type === 'file';
+            const isMultiline = pair.type === 'text' && pair.multiline;
+            const bytes = isMultiline ? utf8ByteLength(pair.value) : 0;
+            const lowerName = pair.name.toLowerCase();
+            const isPairDisabled = !!readOnlyDisabledByName?.[lowerName];
+
+            let valueEditor = (
+              <OneLineEditor
+                id={'key-value-editor__value' + pair.id}
+                historyKey={'key-value-editor__value' + pair.id}
+                placeholder={valuePlaceholder || 'Value'}
+                defaultValue={pair.value}
+                readOnly
+                getAutocompleteConstants={() => handleGetAutocompleteValueConstants?.(pair) || []}
+                onChange={() => {}}
+              />
+            );
+
+            if (isFile) {
+              valueEditor = (
+                <FileInputButton
+                  showFileName
+                  showFileIcon
+                  disabled
+                  className="flex w-full flex-1 items-center justify-center gap-2 overflow-hidden rounded-xs px-2 py-1 text-sm text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) focus:ring-(--hl-md) focus:ring-inset aria-pressed:bg-(--hl-sm)"
+                  path={pair.fileName || ''}
+                  onChange={() => {}}
+                />
+              );
+            }
+
+            if (isMultiline) {
+              valueEditor = (
+                <Button
+                  isDisabled
+                  className="flex w-full flex-1 items-center justify-center gap-2 overflow-hidden rounded-xs px-2 py-1 text-sm text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) focus:ring-(--hl-md) focus:ring-inset aria-pressed:bg-(--hl-sm)"
+                >
+                  <i className="fa fa-pencil-square-o space-right" />
+                  {bytes > 0 ? describeByteSize(bytes, true) : 'Click to Edit'}
+                </Button>
+              );
+            }
+
+            return (
+              <ListBoxItem
+                textValue={pair.name + '-' + pair.value}
+                style={{ opacity: isPairDisabled ? '0.4' : '1' }}
+                className={`relative grid h-(--line-height-sm) shrink-0 gap-2 bg-(--color-bg) px-2 outline-hidden ${showDescription ? 'grid-cols-[max-content_1fr_1fr_1fr_max-content]' : 'grid-cols-[max-content_1fr_1fr_max-content]'}`}
+              >
+                <div
+                  slot="drag"
+                  className="invisible flex w-5 shrink-0 cursor-grab items-center justify-center p-2 focus-visible:bg-(--hl-sm)"
+                >
+                  <Icon icon="grip-vertical" className="w-2 text-(--hl)" />
+                </div>
+                <div>
+                  <OneLineEditor
+                    id={'key-value-editor__name' + pair.id}
+                    historyKey={'key-value-editor__name' + pair.id}
+                    placeholder={namePlaceholder || 'Name'}
+                    defaultValue={pair.name}
+                    readOnly
+                    onChange={() => {}}
+                  />
+                </div>
+                <div>{valueEditor}</div>
+                {showDescription && (
+                  <div>
+                    <OneLineEditor
+                      id={'key-value-editor__description' + pair.id}
+                      historyKey={'key-value-editor__description' + pair.id}
+                      placeholder={descriptionPlaceholder || 'Description'}
+                      defaultValue={pair.description || ''}
+                      readOnly
+                      onChange={() => {}}
+                    />
+                  </div>
+                )}
+                <Toolbar className="flex items-center gap-1">
+                  {pair.canDisable && onReadOnlyDisabledChange ? (
+                    <ToggleButton
+                      className="flex aspect-square h-7 items-center justify-center rounded-xs text-sm text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) focus:ring-(--hl-md) focus:ring-inset"
+                      onChange={isSelected => onReadOnlyDisabledChange(lowerName, !isSelected)}
+                      isSelected={!isPairDisabled}
+                    >
+                      <Icon icon={isPairDisabled ? 'square' : 'check-square'} />
+                    </ToggleButton>
+                  ) : (
+                    <div aria-hidden="true" className="aspect-square h-7" />
+                  )}
+                  <div aria-hidden="true" className="aspect-square h-7" />
+                </Toolbar>
+              </ListBoxItem>
+            );
+          }}
+        </ListBox>
+      )}
+      <div
+        // Clicking anywhere on the blank row drops the cursor into its name editor so the
+        // user can immediately start typing, unless they clicked directly on an editor or
+        // control.
+        onClick={event => {
+          const target = event.target as HTMLElement;
+          if (target.closest('.editor--single-line') || target.closest('button')) {
+            return;
+          }
+          if ((target.closest('[data-key]') as HTMLElement | null)?.dataset.key === blankId) {
+            blankNameEditorRef.current?.focusEnd();
+          }
+        }}
+        className="relative flex w-full flex-col overflow-hidden"
+      >
+        <ListBox
+          aria-label="Key-value pairs"
+          selectionMode="none"
+          disallowTypeAhead
+          className="relative flex w-full flex-1 flex-col overflow-y-auto pt-1"
+          dragAndDropHooks={dragAndDropHooks}
+          dependencies={[upsertPair, showDescription, blankId]}
+          items={pairsListItems}
+        >
+          {pair => {
+            const isFile = pair.type === 'file';
+            const isMultiline = pair.type === 'text' && pair.multiline;
+            const bytes = isMultiline ? utf8ByteLength(pair.value) : 0;
+            const isOnlyTextAllowed = !allowFile && !allowMultiline;
+            const isBlank = pair.id === blankId;
+
+            let valueEditor = (
+              <OneLineEditor
+                id={'key-value-editor__value' + pair.id}
+                historyKey={'key-value-editor__value' + pair.id}
+                key={'key-value-editor__value' + pair.id + pair.disabled}
+                placeholder={valuePlaceholder || 'Value'}
+                defaultValue={pair.value}
+                readOnly={pair.disabled || isDisabled}
+                getAutocompleteConstants={() => handleGetAutocompleteValueConstants?.(pair) || []}
+                onChange={value => upsertPair({ ...pair, value })}
+              />
+            );
+
+            if (isFile) {
+              valueEditor = (
+                <FileInputButton
+                  showFileName
+                  showFileIcon
+                  disabled={pair.disabled || isDisabled}
+                  className="flex h-full w-full flex-1 shrink-0 items-center justify-center gap-2 overflow-hidden rounded-xs px-2 py-1 text-sm text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) focus:ring-(--hl-md) focus:ring-inset aria-pressed:bg-(--hl-sm)"
+                  path={pair.fileName || ''}
+                  onChange={fileName => upsertPair({ ...pair, fileName })}
+                />
+              );
+            }
+
+            if (isMultiline) {
+              valueEditor = (
+                <Button
+                  isDisabled={pair.disabled || isDisabled}
+                  className="flex h-full w-full flex-1 items-center justify-center gap-2 overflow-hidden rounded-xs px-2 py-1 text-sm text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) focus:ring-(--hl-md) focus:ring-inset aria-pressed:bg-(--hl-sm)"
+                  onPress={() =>
+                    showModal(CodePromptModal, {
+                      submitName: 'Done',
+                      title: `Edit ${pair.name}`,
+                      defaultValue: pair.value,
+                      mode: pair.multiline && typeof pair.multiline === 'string' ? pair.multiline : 'text/plain',
+                      onChange: (value: string) => upsertPair({ ...pair, value }),
+                      onModeChange: (mode: string) => upsertPair({ ...pair, multiline: mode }),
+                    })
+                  }
+                >
+                  <i className="fa fa-pencil-square-o space-right" />
+                  {bytes > 0 ? describeByteSize(bytes, true) : 'Click to Edit'}
+                </Button>
+              );
+            }
+
+            let selectedValueType = 'text';
+
+            if (isFile) {
+              selectedValueType = 'file';
+            } else if (isMultiline) {
+              selectedValueType = 'multiline-text';
+            }
+
+            return (
+              <ListBoxItem
+                id={pair.id}
+                key={pair.id}
+                textValue={pair.name + '-' + pair.value}
+                style={{ opacity: pair.disabled ? '0.4' : '1' }}
+                className={`relative grid h-(--line-height-sm) shrink-0 gap-2 bg-(--color-bg) px-2 outline-hidden ${showDescription ? 'grid-cols-[max-content_1fr_1fr_1fr_max-content]' : 'grid-cols-[max-content_1fr_1fr_max-content]'}`}
+                onFocus={event => {
+                  if (isDisabled) {
+                    return;
+                  }
+                  // Only react when the row element itself takes focus, never an inner editor/control.
+                  if (event.target !== event.currentTarget) {
+                    return;
+                  }
+                  const listbox = event.currentTarget.closest('[role="listbox"]');
+                  const enteredFromOutside = !listbox?.contains(event.relatedTarget as Node | null);
+                  // Tabbing onto the grid (focus entering from outside) or landing on the trailing blank
+                  // row drops the cursor into the blank row's Name editor so the user can start typing a
+                  // new pair immediately. Arrow-key navigation between existing rows is left untouched.
+                  if (enteredFromOutside || isBlank) {
+                    blankNameEditorRef.current?.focusEnd();
+                  }
+                }}
+              >
+                <div
+                  slot="drag"
+                  className={`flex w-5 shrink-0 items-center justify-center p-2 focus-visible:bg-(--hl-sm) ${isBlank ? 'invisible' : 'cursor-grab'}`}
+                >
+                  <Icon icon="grip-vertical" className="w-2 text-(--hl)" />
+                </div>
+                <div>
+                  <OneLineEditor
+                    ref={isBlank ? blankNameEditorRef : undefined}
+                    id={'key-value-editor__name' + pair.id}
+                    historyKey={'key-value-editor__name' + pair.id}
+                    key={'key-value-editor__name' + pair.id + pair.disabled}
+                    placeholder={namePlaceholder || 'Name'}
+                    defaultValue={pair.name}
+                    readOnly={pair.disabled || isDisabled}
+                    autoFocus={pair.id === pendingFocusLastRowId}
+                    onAutoFocus={() => {
+                      if (pendingFocusLastRowId === pair.id) {
+                        pendingFocusLastRowId = null;
+                      }
+                    }}
+                    getAutocompleteConstants={() => handleGetAutocompleteNameConstants?.(pair) || []}
+                    onChange={name => {
+                      upsertPair({ ...pair, name });
+                    }}
+                  />
+                </div>
+                <div>{valueEditor}</div>
+                {showDescription && (
+                  <div>
+                    <OneLineEditor
+                      id={'key-value-editor__description' + pair.id}
+                      historyKey={'key-value-editor__description' + pair.id}
+                      key={'key-value-editor__description' + pair.id + pair.disabled}
+                      placeholder={descriptionPlaceholder || 'Description'}
+                      defaultValue={pair.description || ''}
+                      readOnly={pair.disabled || isDisabled}
+                      onChange={description => upsertPair({ ...pair, description })}
+                    />
+                  </div>
+                )}
+                <Toolbar className="flex items-center gap-1">
+                  {!isOnlyTextAllowed && (
+                    <MenuTrigger>
+                      <Button
+                        aria-label="Text mode"
+                        className="flex aspect-square h-7 items-center justify-center rounded-xs text-sm text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) focus:ring-(--hl-md) focus:ring-inset aria-pressed:bg-(--hl-sm)"
+                      >
+                        <Icon icon="caret-down" />
+                      </Button>
+                      <Popover className="flex min-w-max flex-col overflow-y-hidden">
+                        <Menu
+                          className="min-w-max overflow-y-auto rounded-md border border-solid border-(--hl-sm) bg-(--color-bg) py-2 text-sm shadow-lg select-none focus:outline-hidden"
+                          aria-label="Select value type"
+                          selectionMode="single"
+                          selectedKeys={[selectedValueType]}
+                          items={[
+                            {
+                              id: 'text',
+                              name: 'Text',
+                              textValue: 'Text',
+                              onAction: () => upsertPair({ ...pair, type: 'text', multiline: false }),
+                            },
+                            ...(allowMultiline
+                              ? [
+                                  {
+                                    id: 'multiline-text',
+                                    name: 'Multiline text',
+                                    textValue: 'Multiline text',
+                                    onAction: () => upsertPair({ ...pair, type: 'text', multiline: true }),
+                                  },
+                                ]
+                              : []),
+                            ...(allowFile
+                              ? [
+                                  {
+                                    id: 'file',
+                                    name: 'File',
+                                    textValue: 'File',
+                                    onAction: () => upsertPair({ ...pair, type: 'file' }),
+                                  },
+                                ]
+                              : []),
+                          ]}
+                        >
+                          {item => (
+                            <MenuItem
+                              key={item.id}
+                              id={item.id}
+                              onAction={item.onAction}
+                              className="flex h-(--line-height-xs) w-full items-center gap-2 bg-transparent px-(--padding-md) whitespace-nowrap text-(--color-font) transition-colors hover:bg-(--hl-sm) focus:bg-(--hl-xs) focus:outline-hidden disabled:cursor-not-allowed aria-selected:font-bold"
+                              aria-label={item.name}
+                            >
+                              <span>{item.name}</span>
+                            </MenuItem>
+                          )}
+                        </Menu>
+                      </Popover>
+                    </MenuTrigger>
+                  )}
+                  <ToggleButton
+                    className="flex aspect-square h-7 items-center justify-center rounded-xs text-sm text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) focus:ring-(--hl-md) focus:ring-inset"
+                    onChange={isSelected => upsertPair({ ...pair, disabled: !isSelected })}
+                    isSelected={!pair.disabled}
+                    isDisabled={isDisabled || isBlank}
+                  >
+                    <Icon icon={pair.disabled ? 'square' : 'check-square'} />
+                  </ToggleButton>
+                  <PromptButton
+                    disabled={isBlank || isDisabled}
+                    className="flex aspect-square h-7 items-center justify-center rounded-xs text-sm text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) focus:ring-(--hl-md) focus:ring-inset disabled:opacity-50 aria-pressed:bg-(--hl-sm)"
+                    confirmMessage=""
+                    doneMessage=""
+                    onClick={() => {
+                      // Drop the deleted row's cached undo history (keyed on pair.id)
+                      // so its ephemeral entries don't linger in the shared cache.
+                      const pairId = pair.id;
+                      if (pairId) {
+                        purgeCachedEditorStates(key => key.includes(pairId));
+                      }
+                      onChange(persistedItems.filter(item => item.id !== pair.id));
+                    }}
+                  >
+                    <Icon icon="trash-can" />
+                  </PromptButton>
+                </Toolbar>
+              </ListBoxItem>
+            );
+          }}
+        </ListBox>
+      </div>
+    </Fragment>
+  );
+};

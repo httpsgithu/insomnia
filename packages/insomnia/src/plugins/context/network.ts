@@ -1,0 +1,135 @@
+import { services } from 'insomnia-data';
+import { ProxyScopes, RESPONSE_CODE_REASONS } from 'insomnia-data/common';
+import { v4 as uuidv4 } from 'uuid';
+
+import {
+  createSensitiveValueCollector,
+  redactResponsePatch,
+  withRedaction,
+} from '~/common/network/sensitive-value-collector';
+import type { NodeCurlRequestOptions, NodeCurlResponseType, PluginTemplateTagContext } from '~/common/templating/types';
+
+import {
+  defaultSendActionRuntime,
+  fetchRequestData,
+  responseTransform,
+  sendCurlAndWriteTimeline,
+  tryToInterpolateRequest,
+  tryToTransformRequestWithPlugins,
+} from '../../network/network';
+
+export function init(): {
+  network: PluginTemplateTagContext['network'];
+} {
+  return {
+    network: {
+      async sendRequest(req, extraInfo) {
+        const {
+          request,
+          environment,
+          settings,
+          clientCertificates,
+          caCert,
+          activeEnvironmentId,
+          timelinePath,
+          responseId,
+        } = await fetchRequestData(req._id, extraInfo?.environmentId);
+
+        // This request renders with purpose 'send', so confidential values are real here and
+        // need the same timeline/response redaction the main send path gets.
+        const collector = createSensitiveValueCollector(settings.hideSecretValuesInPreviewAndConsole ?? true);
+        const renderResult = await tryToInterpolateRequest({
+          request,
+          environment: environment._id,
+          purpose: 'send',
+          extraInfo,
+          sensitiveValueCollector: collector,
+        });
+        const renderedRequest = await tryToTransformRequestWithPlugins(renderResult);
+        const response = await sendCurlAndWriteTimeline(
+          renderedRequest,
+          clientCertificates,
+          caCert,
+          settings,
+          timelinePath,
+          responseId,
+          withRedaction(defaultSendActionRuntime, collector),
+        );
+        const responsePatch = await responseTransform(
+          response,
+          activeEnvironmentId,
+          renderedRequest,
+          renderResult.context,
+        );
+        return services.response.create(redactResponsePatch(responsePatch, collector), settings.maxHistoryResponses);
+      },
+      // using node-curl to send a request directly, without context render and database write for request and response
+      async sendRequestWithoutSideEffects(options: NodeCurlRequestOptions): Promise<NodeCurlResponseType> {
+        const requestId = uuidv4();
+        const settings = await services.settings.get();
+        if (settings.proxyScope !== ProxyScopes.all) {
+          // Disable proxying unless user chooses "All traffic sent by Insomnia" (all).
+          settings.proxyEnabled = false;
+        }
+        const settingFollowRedirects = settings?.followRedirects ? 'on' : 'off';
+        const { request: originRequest, caCertficatePath = null } = options;
+        const curlRequest = __IS_RENDERER__
+          ? window.main.curlRequest
+          : // when exeucted in Inso;
+            (await import('../../main/network/libcurl-promise')).curlRequest;
+        const response = await curlRequest({
+          requestId: `no-sideEffects-request-${requestId}`,
+          req: {
+            authentication: {},
+            body: {},
+            cookieJar: {
+              cookies: [],
+            },
+            cookies: [],
+            suppressUserAgent: false,
+            settingFollowRedirects,
+            settingRebuildPath: true,
+            settingSendCookies: true,
+            ...originRequest,
+          },
+          finalUrl: originRequest.url,
+          settings,
+          certificates: [],
+          caCertficatePath,
+        });
+        const { headerResults, patch, responseBodyPath } = response;
+        if (patch.error) {
+          throw new Error(patch.error);
+        }
+        if (headerResults.length === 0) {
+          throw new Error('Error in response: no header result is found');
+        }
+        const lastRedirect = headerResults[headerResults.length - 1];
+        if (!lastRedirect) {
+          throw new Error('Error in response: the lastRedirect is not defined');
+        }
+        const bodyResult = await services.helpers.readCurlResponse({
+          bodyPath: responseBodyPath,
+          bodyCompression: patch.bodyCompression,
+        });
+
+        return {
+          code: lastRedirect.code,
+          reason: lastRedirect.reason,
+          headers: lastRedirect.headers,
+          responseTime: patch.elapsedTime,
+          body: bodyResult.body,
+          ok: lastRedirect.code >= 200 && lastRedirect.code < 300,
+          status: lastRedirect.reason || RESPONSE_CODE_REASONS[lastRedirect.code] || 'Unknown',
+          json: () => {
+            try {
+              return JSON.parse(bodyResult.body);
+            } catch (error) {
+              throw new Error(`Error parsing JSON response: ${error}`);
+            }
+          },
+        };
+      },
+    },
+  };
+}

@@ -1,0 +1,333 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { services } from 'insomnia-data';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { database as db } from '../../../common/database';
+import { RepoFileWatcherRegistry } from '../repo-file-watcher';
+
+vi.mock('../../../common/insomnia-v5', () => ({
+  getInsomniaV5DataExport: vi.fn().mockResolvedValue('type: collection.insomnia.rest/5.0\nname: Preserved\n'),
+  tryImportV5Data: vi.fn().mockReturnValue({ data: undefined, error: undefined }),
+}));
+
+const REPO_ID = 'git_repo_test';
+const PROJECT_ID = 'proj_test';
+
+const makeRegistry = () =>
+  new RepoFileWatcherRegistry({
+    onDbSynced: vi.fn(),
+    onProblemsChanged: vi.fn(),
+  });
+
+const createWorkspaceWithMeta = async (gitFilePath: string, gitFileLastSyncTime: number | null) => {
+  const workspace = await services.workspace.create({
+    name: 'My Collection',
+    scope: 'collection',
+    parentId: PROJECT_ID,
+  });
+  const meta = await services.workspaceMeta.getOrCreateByParentId(workspace._id);
+  await services.workspaceMeta.update(meta, { gitFilePath, gitFileLastSyncTime });
+  return workspace;
+};
+
+describe('RepoFileWatcher orphan reconciliation', () => {
+  let repoDir: string;
+  let registry: RepoFileWatcherRegistry;
+
+  beforeEach(async () => {
+    await db.init({ inMemoryOnly: true }, true);
+    repoDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'insomnia-repo-watcher-'));
+    registry = makeRegistry();
+  });
+
+  afterEach(async () => {
+    registry.stopAll();
+    await fs.promises.rm(repoDir, { recursive: true, force: true });
+    vi.clearAllMocks();
+  });
+
+  // Regression for the Git Sync data-loss bug: connecting an empty repo to a
+  // project that already has local data must NOT delete that data.
+  it('preserves a never-synced workspace whose YAML is absent from disk', async () => {
+    const workspace = await createWorkspaceWithMeta('insomnia.wrk_local.yaml', null);
+
+    await registry.startWatcher(REPO_ID, repoDir, PROJECT_ID);
+
+    // Workspace must still exist in the DB.
+    const stillThere = await services.workspace.getById(workspace._id);
+    expect(stillThere).not.toBeNull();
+
+    // And it must have been written to disk so the user can commit it.
+    const written = await fs.promises
+      .access(path.join(repoDir, 'insomnia.wrk_local.yaml'))
+      .then(() => true)
+      .catch(() => false);
+    expect(written).toBe(true);
+  });
+
+  it('removes a previously-synced workspace whose YAML was deleted on the remote', async () => {
+    const workspace = await createWorkspaceWithMeta('insomnia.wrk_synced.yaml', Date.now());
+
+    await registry.startWatcher(REPO_ID, repoDir, PROJECT_ID);
+
+    const removed = await services.workspace.getById(workspace._id);
+    expect(removed).toBeFalsy();
+  });
+
+  it('keeps a workspace whose YAML is present on disk', async () => {
+    const workspace = await createWorkspaceWithMeta('insomnia.wrk_present.yaml', Date.now());
+    await fs.promises.writeFile(path.join(repoDir, 'insomnia.wrk_present.yaml'), 'name: Present\n', 'utf8');
+
+    await registry.startWatcher(REPO_ID, repoDir, PROJECT_ID);
+
+    const stillThere = await services.workspace.getById(workspace._id);
+    expect(stillThere).not.toBeNull();
+  });
+});
+
+describe('RepoFileWatcher deleted-folder resurrection', () => {
+  let repoDir: string;
+  let registry: RepoFileWatcherRegistry;
+
+  beforeEach(async () => {
+    await db.init({ inMemoryOnly: true }, true);
+    repoDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'insomnia-repo-watcher-resurrect-'));
+    registry = makeRegistry();
+  });
+
+  afterEach(async () => {
+    registry.stopAll();
+    await fs.promises.rm(repoDir, { recursive: true, force: true });
+    vi.clearAllMocks();
+  });
+
+  const folderExists = (dir: string) =>
+    fs.promises
+      .access(dir)
+      .then(() => true)
+      .catch(() => false);
+
+  // Regression: a repo folder renamed/moved/deleted outside Insomnia must stay
+  // gone. Previously, flushWorkspacesToDisk() — which every git-status poll
+  // triggers via flushNow(), and every DB edit triggers via its debounced
+  // listener — unconditionally `mkdir -p`d the repo's base directory before
+  // writing, silently resurrecting it as an empty folder with no relocate/
+  // reclone action from the user at all.
+  it('does not resurrect the repo folder via flushNow() after it is deleted externally', async () => {
+    const workspace = await createWorkspaceWithMeta('insomnia.wrk_local.yaml', Date.now());
+    await registry.startWatcher(REPO_ID, repoDir, PROJECT_ID);
+    expect(await folderExists(repoDir)).toBe(true);
+
+    // Simulate the user deleting/renaming the folder outside Insomnia.
+    await fs.promises.rm(repoDir, { recursive: true, force: true });
+    expect(await folderExists(repoDir)).toBe(false);
+
+    // Mirrors gitStatusAction's status-poll flush — the passive trigger that
+    // used to resurrect the folder with no user action at all.
+    await registry.flushNow(REPO_ID);
+
+    expect(await folderExists(repoDir)).toBe(false);
+    // The workspace itself must survive too — it wasn't actually deleted, its
+    // folder was just temporarily unavailable.
+    expect(await services.workspace.getById(workspace._id)).not.toBeNull();
+  });
+
+  // Regression: the content-hash dedup cache only reflects "has the DB
+  // changed since our last write", not "does the write still exist on disk".
+  // Once the folder comes back (e.g. via relocate/adopt), a flush must still
+  // restore its content even though the DB itself never changed — previously
+  // it stayed missing indefinitely because the unchanged hash short-circuited
+  // the write.
+  it('restores workspace content once the folder reappears, even though the DB never changed', async () => {
+    // `null` = never-synced-yet (local-only) — preserved and written to disk,
+    // rather than treated as "was synced, now missing on disk → orphaned".
+    await createWorkspaceWithMeta('insomnia.wrk_local.yaml', null);
+    await registry.startWatcher(REPO_ID, repoDir, PROJECT_ID);
+    const filePath = path.join(repoDir, 'insomnia.wrk_local.yaml');
+    expect(await folderExists(filePath)).toBe(true);
+
+    await fs.promises.rm(repoDir, { recursive: true, force: true });
+    await registry.flushNow(REPO_ID);
+    expect(await folderExists(repoDir)).toBe(false);
+
+    // The folder comes back (e.g. the app relocated/adopted it back into
+    // place) — empty, since nothing recreated its contents yet.
+    await fs.promises.mkdir(repoDir, { recursive: true });
+    await registry.flushNow(REPO_ID);
+
+    expect(await folderExists(filePath)).toBe(true);
+  });
+});
+
+describe('RepoFileWatcher ruleset import problems', () => {
+  let repoDir: string;
+  let registry: RepoFileWatcherRegistry;
+  const RULESET_PATH = '.spectral.yaml';
+  const VALID_RULESET = 'extends:\n  - "spectral:oas"\nrules: {}\n';
+  const INVALID_RULESET = 'rules:\n  - [unclosed';
+
+  const getRulesetImportIssue = (repoId: string) =>
+    registry.getProblems(repoId).find(problem => problem.relPath === RULESET_PATH) ?? null;
+
+  beforeEach(async () => {
+    await db.init({ inMemoryOnly: true }, true);
+    repoDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'insomnia-repo-watcher-ruleset-'));
+    registry = makeRegistry();
+  });
+
+  afterEach(async () => {
+    registry.stopAll();
+    await fs.promises.rm(repoDir, { recursive: true, force: true });
+    vi.clearAllMocks();
+  });
+
+  it('surfaces the .spectral.yaml problem when invalid and clears it once fixed', async () => {
+    const absPath = path.join(repoDir, RULESET_PATH);
+
+    // Invalid → issue surfaced.
+    await fs.promises.writeFile(absPath, INVALID_RULESET, 'utf8');
+    await registry.startWatcher(REPO_ID, repoDir, PROJECT_ID);
+    expect(getRulesetImportIssue(REPO_ID)).toMatchObject({ kind: 'parse-error', relPath: RULESET_PATH });
+
+    // Fixed → issue cleared.
+    await fs.promises.writeFile(absPath, VALID_RULESET, 'utf8');
+    await registry.importAllFiles(REPO_ID);
+    expect(getRulesetImportIssue(REPO_ID)).toBeNull();
+  });
+
+  it('returns null when the ruleset is valid', async () => {
+    await fs.promises.writeFile(path.join(repoDir, RULESET_PATH), VALID_RULESET, 'utf8');
+    await registry.startWatcher(REPO_ID, repoDir, PROJECT_ID);
+    expect(getRulesetImportIssue(REPO_ID)).toBeNull();
+  });
+
+  it('returns null when the watcher is not running', () => {
+    expect(getRulesetImportIssue('nonexistent_repo')).toBeNull();
+  });
+
+  // Regression: uploading a valid ruleset over a previously-invalid committed
+  // file must clear the stale problem, so the spec page stops showing
+  // "Invalid ruleset — using default".
+  it('clears a stale ruleset problem after a valid ruleset is stored via upload', async () => {
+    const absPath = path.join(repoDir, RULESET_PATH);
+    await fs.promises.writeFile(absPath, INVALID_RULESET, 'utf8');
+    await registry.startWatcher(REPO_ID, repoDir, PROJECT_ID);
+    expect(getRulesetImportIssue(REPO_ID)).not.toBeNull();
+
+    // Simulate a UI upload: valid ruleset upserted to the DB, then flushed to disk.
+    await services.projectLintRuleset.upsert(PROJECT_ID, { rulesetContent: VALID_RULESET });
+    await registry.flushNow(REPO_ID);
+
+    expect(getRulesetImportIssue(REPO_ID)).toBeNull();
+  });
+
+  // Regression: cloning a repo whose committed .spectral.yaml is invalid must
+  // never delete the file. Previously, an invalid ruleset was silently
+  // ignored (not recognized as a ruleset at all) instead of being rejected,
+  // so nothing prevented the file from later being deleted as a stale
+  // tracked file — which git staged as a deletion that Discard could never
+  // resolve, since re-importing the same invalid content each time was also
+  // a silent no-op.
+  it('keeps an invalid cloned ruleset on disk and out of the DB, surviving repeated re-imports', async () => {
+    const absPath = path.join(repoDir, RULESET_PATH);
+    await fs.promises.writeFile(absPath, INVALID_RULESET, 'utf8');
+
+    // Simulate the initial clone import.
+    await registry.startWatcher(REPO_ID, repoDir, PROJECT_ID);
+
+    const exists = () => fs.promises.access(absPath).then(() => true).catch(() => false);
+    expect(await exists()).toBe(true);
+    expect(await services.projectLintRuleset.getByParentId(PROJECT_ID)).toBeFalsy();
+    expect(getRulesetImportIssue(REPO_ID)).not.toBeNull();
+
+    // Simulate a Discard, which re-writes the same invalid content (as if
+    // restored from git HEAD), followed by the resulting re-import.
+    await fs.promises.writeFile(absPath, INVALID_RULESET, 'utf8');
+    await registry.importAllFiles(REPO_ID);
+    await registry.flushNow(REPO_ID);
+
+    expect(await exists()).toBe(true);
+    expect(await services.projectLintRuleset.getByParentId(PROJECT_ID)).toBeFalsy();
+    expect(getRulesetImportIssue(REPO_ID)).not.toBeNull();
+  });
+});
+
+describe('RepoFileWatcher symlink write containment', () => {
+  let repoDir: string;
+  let outsideDir: string;
+  let registry: RepoFileWatcherRegistry;
+  const RULESET_PATH = '.spectral.yaml';
+  const VALID_RULESET = 'extends:\n  - "spectral:oas"\nrules: {}\n';
+
+  beforeEach(async () => {
+    await db.init({ inMemoryOnly: true }, true);
+    repoDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'insomnia-repo-watcher-symlink-'));
+    outsideDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'insomnia-repo-watcher-outside-'));
+    registry = makeRegistry();
+  });
+
+  afterEach(async () => {
+    registry.stopAll();
+    await fs.promises.rm(repoDir, { recursive: true, force: true });
+    await fs.promises.rm(outsideDir, { recursive: true, force: true });
+    vi.clearAllMocks();
+  });
+
+  // Regression for the Git-Sync symlink write-containment fix: a commit
+  // swaps .spectral.yaml (or a workspace's YAML file) for a symlink escaping
+  // the repo. Once the DB already holds a validated ruleset for the
+  // (now-stale) file, every automatic flush (git-status poll, app restart)
+  // must never write that content through the symlink to whatever it points
+  // at outside the repo.
+  it('never writes the project lint ruleset through a symlink escaping the repo', async () => {
+    const target = path.join(outsideDir, 'outside-file.txt');
+    const originalContent = 'this must never change\n';
+    await fs.promises.writeFile(target, originalContent, 'utf8');
+
+    const absPath = path.join(repoDir, RULESET_PATH);
+    // Simulate a prior valid import (commit 1) followed by the symlink swap
+    // (commit 2): the DB already holds validated content for a path that is
+    // now a symlink pointing outside the repo.
+    await services.projectLintRuleset.upsert(PROJECT_ID, { rulesetContent: VALID_RULESET });
+    await fs.promises.symlink(path.relative(repoDir, target), absPath);
+
+    await registry.startWatcher(REPO_ID, repoDir, PROJECT_ID);
+    await registry.flushNow(REPO_ID);
+
+    expect(await fs.promises.readFile(target, 'utf8')).toBe(originalContent);
+    // The symlink itself must be left alone too, not silently deleted/replaced.
+    const stat = await fs.promises.lstat(absPath);
+    expect(stat.isSymbolicLink()).toBe(true);
+  });
+
+  it('never writes a workspace export through a symlink escaping the repo', async () => {
+    const target = path.join(outsideDir, 'outside-workspace-file.txt');
+    const originalContent = 'this must never change either\n';
+    await fs.promises.writeFile(target, originalContent, 'utf8');
+
+    const gitFilePath = 'insomnia.wrk_symlinked.yaml';
+    const absPath = path.join(repoDir, gitFilePath);
+
+    // Simulate the real-world sequence: the workspace file is a normal,
+    // already-tracked file when the watcher starts (first clone) — then, in
+    // a later pull, a commit swaps it for a symlink escaping the repo.
+    // gitStatusAction's flushNow() runs on every status poll/restart WITHOUT
+    // re-running importAllFiles' orphan reconciliation in between, so this
+    // must be safe even though nothing re-scans the file first.
+    await fs.promises.writeFile(absPath, 'name: Original\n', 'utf8');
+    await createWorkspaceWithMeta(gitFilePath, Date.now());
+    await registry.startWatcher(REPO_ID, repoDir, PROJECT_ID);
+
+    await fs.promises.rm(absPath);
+    await fs.promises.symlink(path.relative(repoDir, target), absPath);
+
+    await registry.flushNow(REPO_ID);
+
+    expect(await fs.promises.readFile(target, 'utf8')).toBe(originalContent);
+    const stat = await fs.promises.lstat(absPath);
+    expect(stat.isSymbolicLink()).toBe(true);
+  });
+});

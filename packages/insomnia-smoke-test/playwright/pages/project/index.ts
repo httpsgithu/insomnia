@@ -1,0 +1,396 @@
+import type { ElectronApplication, Locator, Page } from '@playwright/test';
+
+import { loadFixture } from '../../paths';
+import { mockOpenDialogForDirectory, mockSaveDialogForFile } from '../../utils';
+import { BasePage } from '../base-page';
+import { NavigationSidebar } from '../components/navigation-sidebar';
+import { WorkspaceListComponent } from './workspace-list';
+
+export type ProjectStorageType = 'local' | 'remote' | 'git';
+
+const storageTypeNames: Record<ProjectStorageType, string> = {
+  local: 'Local Vault',
+  remote: 'Cloud Sync',
+  git: 'Git Sync',
+};
+
+/**
+ * Page Object for the **project page** (file list view).
+ *
+ * Visible at route: `/organization/:orgId/project/:projectId`
+ *
+ * Composes shared layout components and project-specific components:
+ * - TopNavBar, Statusbar, NavBar, TabBar (layout)
+ * - Sidebar, Toolbar, WorkspaceList (project-specific)
+ */
+export class ProjectPage extends BasePage {
+  /** The workspace list (files). */
+  readonly workspaceList: WorkspaceListComponent;
+  readonly sidebar: NavigationSidebar;
+  constructor(
+    readonly page: Page,
+    readonly app: ElectronApplication,
+  ) {
+    super(page);
+    this.workspaceList = new WorkspaceListComponent(page);
+    this.sidebar = new NavigationSidebar(page);
+  }
+
+  /** The root app container. */
+  get root() {
+    return this.page.locator('.app');
+  }
+
+  get scanButton() {
+    return this.page.getByRole('button', { name: 'Scan' });
+  }
+
+  get importButton() {
+    return this.page.getByRole('dialog').getByRole('button', { name: 'Import' });
+  }
+
+  // ===========================================================================
+  // Project dashboard navigation
+  // ===========================================================================
+
+  private readonly projectDashboardUrl = /\/organization\/[^/]+\/project\/[^/]+$/;
+
+  async waitForProjectDashboard(): Promise<void> {
+    await this.page.waitForURL(this.projectDashboardUrl, { timeout: 30_000, waitUntil: 'commit' });
+    await this.page.getByTestId('workspace-page').waitFor({ state: 'hidden' });
+    await this.page.getByRole('grid', { name: 'Files' }).waitFor({ state: 'visible' });
+  }
+
+  async navigateFromWorkspaceBreadcrumb(projectName = 'Personal Workspace'): Promise<void> {
+    await this.page.keyboard.press('Escape');
+    await this.page.mouse.move(0, 0);
+
+    const maxAttempts = 4;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (this.projectDashboardUrl.test(this.page.url())) {
+        break;
+      }
+
+      const breadcrumbLink = this.page.getByTestId('workspace-breadcrumb-level-0').getByRole('link');
+      await ((await breadcrumbLink.isVisible())
+        ? breadcrumbLink.click()
+        : this.sidebar.projectRow(projectName).click());
+
+      try {
+        await this.page.waitForURL(this.projectDashboardUrl, { timeout: 5000, waitUntil: 'commit' });
+        break;
+      } catch (error) {
+        if (attempt === maxAttempts) {
+          throw error;
+        }
+      }
+    }
+
+    await this.waitForProjectDashboard();
+  }
+
+  // ===========================================================================
+  // Workspace creation
+  // ===========================================================================
+
+  async selectCreateInProjectType(typeName: string): Promise<void> {
+    await this.waitForProjectDashboard();
+    await this.page.keyboard.press('Escape');
+    await this.page.getByLabel('Create in project').click();
+    const menuItem = this.page.getByRole('menuitemradio', { name: typeName }).last();
+    await menuItem.waitFor({ state: 'visible' });
+    await menuItem.click();
+  }
+
+  async createCollection(name = 'My Collection'): Promise<void> {
+    await this.selectCreateInProjectType('API Collection');
+    await this.page.getByRole('dialog').waitFor({ state: 'visible' });
+    const nameInput = this.page.getByRole('dialog').getByPlaceholder('Enter a name for your API Collection');
+    await nameInput.waitFor({ state: 'visible' });
+    await nameInput.fill(name);
+    await this.page.getByRole('dialog').getByRole('button', { name: 'Create' }).click();
+    await this.page.getByRole('dialog').waitFor({ state: 'hidden' });
+    await this.page
+      .getByLabel('Insomnia Tabs')
+      .getByLabel(`tab-${name}`, { exact: true })
+      .and(this.page.locator('[data-selected="true"]'))
+      .waitFor({ state: 'visible' });
+  }
+
+  // ===========================================================================
+  // Project Creation
+  // ===========================================================================
+
+  /**
+   * Sets the project name in the create/edit modal.
+   * @param name - The project name
+   */
+  private async setProjectName(name: string): Promise<void> {
+    const input = this.page.getByPlaceholder('My Project');
+    await input.click();
+    await input.fill(name);
+  }
+
+  /**
+   * Selects the storage type for the project.
+   * @param storageType - The storage type: 'local' (Local Vault), 'remote' (Cloud Sync), or 'git' (Git Sync)
+   */
+  private async selectStorageType(storageType: ProjectStorageType): Promise<void> {
+    await this.page.getByRole('dialog').getByText(storageTypeNames[storageType]).click();
+  }
+
+  /**
+   * Creates a new project with the specified name and storage type.
+   * @param name - The project name (defaults to 'My Project')
+   * @param storageType - The storage type (defaults to 'local')
+   */
+  async createProject(name = 'My Project', storageType: ProjectStorageType = 'local'): Promise<void> {
+    await this.page.getByRole('button', { name: 'Create new Project' }).click();
+    await this.setProjectName(name);
+    await this.selectStorageType(storageType);
+    await this.page.getByRole('button', { name: 'Create', exact: true }).click();
+    await this.closeProjectModalIfStuck();
+  }
+
+  /**
+   * Known app-side race: the "Create project" dialog can fail to close itself
+   * even though the project was created and the app already navigated to it.
+   */
+  private async closeProjectModalIfStuck(timeout = 5000): Promise<void> {
+    const dialog = this.page.getByRole('dialog', { name: 'Create or update dialog' });
+    const closedOnItsOwn = await dialog
+      .waitFor({ state: 'hidden', timeout })
+      .then(() => true)
+      .catch(() => false);
+
+    if (closedOnItsOwn) {
+      return;
+    }
+
+    await this.page.locator('[data-test-id="project-modal-close-button"]').click();
+
+    // The name/type fields were filled in, so closing can trigger a "discard unsaved changes" confirmation.
+    // App-side race: an in-flight navigation (e.g. from the project just being created) can force-close
+    // the whole modal - confirm dialog included - independent of this click, detaching the "Yes" button
+    // mid-click. Tolerate that here; the waitFor below is the real assertion that the modal is gone.
+    const discardConfirmDialog = this.page.getByRole('dialog', { name: 'Unsaved changes' });
+    if (await discardConfirmDialog.isVisible().catch(() => false)) {
+      await discardConfirmDialog
+        .getByRole('button', { name: 'Yes' })
+        .click({ timeout: 5000 })
+        .catch(() => {});
+    }
+
+    await dialog.waitFor({ state: 'hidden' });
+  }
+
+  /**
+   * Waits for a locator to become clickable (visible, stable, enabled, and not
+   * obscured by e.g. a closing modal's backdrop) before clicking it.
+   */
+  private async clickReliably(locator: Locator, timeout = 10_000): Promise<void> {
+    await locator.waitFor({ state: 'visible', timeout }).then(() => locator.click({ timeout }));
+  }
+
+  /**
+   * Selects an existing local folder in the Git project form without opening it.
+   * The native directory picker is mocked to return `folderPath`.
+   */
+  async chooseGitProjectFolderForOpen(name: string, folderPath: string): Promise<void> {
+    await mockOpenDialogForDirectory(this.app, folderPath);
+    await this.clickReliably(this.page.getByRole('button', { name: 'Create new Project' }));
+    await this.setProjectName(name);
+    await this.selectStorageType('git');
+    await this.page.getByRole('button', { name: 'Open local folder' }).click();
+    await this.page.getByRole('button', { name: 'Choose folder' }).click();
+  }
+
+  /**
+   * Opens an existing local folder as a Git project (no clone). The native
+   * directory picker is mocked to return `folderPath`. If the folder isn't a git
+   * repo, the app runs `git init`.
+   */
+  async openGitProjectFromFolder(name: string, folderPath: string): Promise<void> {
+    await this.chooseGitProjectFolderForOpen(name, folderPath);
+    await this.page.getByRole('button', { name: 'Open', exact: true }).click();
+    // Confirm the "Do you trust this folder?" dialog before the folder is opened/initialized.
+    await this.page.getByRole('button', { name: 'Open folder' }).click();
+    // Same app-side race as createProject(): this flow chains two navigations (create,
+    // then the trust-confirmed git init/adopt), which widens the window for the "Create
+    // project" dialog to miss its self-close effect and leave its backdrop blocking clicks.
+    await this.closeProjectModalIfStuck();
+  }
+
+  /**
+   * Clones a repo into a user-chosen parent folder (the picker is mocked to
+   * return `parentFolderPath`). The repo is cloned into
+   * `<parentFolderPath>/<repo-name>`. Requires the git test server + credential.
+   */
+  async cloneGitProjectIntoFolder(name: string, parentFolderPath: string): Promise<void> {
+    await mockOpenDialogForDirectory(this.app, parentFolderPath);
+    await this.sidebar.clickNewProject();
+    await this.page.getByRole('textbox', { name: 'Project name' }).click();
+    await this.page.getByRole('textbox', { name: 'Project name' }).press('ControlOrMeta+a');
+    await this.page.getByRole('textbox', { name: 'Project name' }).fill(name);
+    await this.selectStorageType('git');
+    await this.page.getByRole('button', { name: 'Git Credentials Authorized as' }).click();
+    await this.page.getByRole('option', { name: 'Custom Git Credential' }).click();
+    await this.page.getByRole('textbox', { name: 'Repository URL' }).click();
+    // Use the reachable git test server URL so remote branches can be listed.
+    // deriveRepoName() still yields "git-server" from this URL.
+    await this.page.getByRole('textbox', { name: 'Repository URL' }).fill('http://localhost:4010/git/git-server.git');
+    await this.page.getByRole('button', { name: 'Show suggestions Branch' }).click();
+    await this.page.getByRole('option', { name: 'master' }).click();
+    // Pick the custom clone destination before scanning.
+    await this.page.getByRole('button', { name: 'Choose folder' }).click();
+    await this.page.getByRole('button', { name: 'Scan for files' }).click();
+    await this.page.getByRole('button', { name: 'Create Blank Project' }).click();
+  }
+
+  async createGitSyncProject(name = 'My Git Project'): Promise<void> {
+    await this.sidebar.clickNewProject();
+    await this.page.getByRole('textbox', { name: 'Project name' }).click();
+    await this.page.getByRole('textbox', { name: 'Project name' }).press('ControlOrMeta+a');
+    await this.page.getByRole('textbox', { name: 'Project name' }).fill(name);
+    await this.selectStorageType('git');
+    // The credential select defaults to whichever credential is first (which can be
+    // the "System Git Credentials" native provider). Open it via its stable label and
+    // explicitly pick the custom Access Token credential rather than relying on the default.
+    await this.page.getByRole('button', { name: 'Git Credentials Authorized as' }).click();
+    await this.page.getByRole('option', { name: 'Custom Git Credential' }).click();
+    await this.page.getByRole('textbox', { name: 'Repository URL' }).click();
+    await this.page.getByRole('textbox', { name: 'Repository URL' }).fill('http://localhost:4010/git/git-server.git');
+    await this.page.getByRole('button', { name: 'Show suggestions Branch' }).click();
+    await this.page.getByRole('option', { name: 'master' }).click();
+    await this.page.getByRole('button', { name: 'Scan for files' }).click();
+    await this.page.getByRole('button', { name: 'Create Blank Project' }).click();
+    const projectModalCloseButton = this.page.locator('[data-test-id="project-modal-close-button"]');
+    await projectModalCloseButton.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+    if (await projectModalCloseButton.isVisible()) {
+      await projectModalCloseButton.click();
+      // The name/type fields were filled in, so closing can trigger a "discard unsaved changes" confirmation.
+      // App-side race: an in-flight navigation (e.g. from the project just being created) can force-close
+      // the whole modal - confirm dialog included - independent of this click, detaching the "Yes" button
+      // mid-click. Tolerate that here; the waitFor below is the real assertion that the modal is gone.
+      const discardConfirmDialog = this.page.getByRole('dialog', { name: 'Unsaved changes' });
+      if (await discardConfirmDialog.isVisible().catch(() => false)) {
+        await discardConfirmDialog
+          .getByRole('button', { name: 'Yes' })
+          .click({ timeout: 5000 })
+          .catch(() => {});
+      }
+    }
+    // The modal's backdrop still intercepts clicks for a moment after closing
+    // (exit animation / unmount), which flakily blocks the click below. Named rather than a bare
+    // `getByRole('dialog')`: the discard confirmation above can briefly coexist with this one, and
+    // a bare role locator matching both is a Playwright strict-mode violation.
+    await this.page.getByRole('dialog', { name: 'Create or update dialog' }).waitFor({ state: 'hidden' });
+    await this.clickReliably(this.page.getByRole('button', { name: 'Personal workspace Organizations' }));
+    await this.page.getByRole('option', { name: /Magic/ }).click();
+    await this.page.getByRole('button', { name: /Magic/ }).click();
+    await this.page.getByRole('option', { name: 'Personal workspace' }).locator('span').click();
+    await this.sidebar.selectProject(name);
+  }
+
+  /**
+   * Clicks "Move repository to another folder" in the project settings modal.
+   * Chains right after that modal opens (which itself follows the "Create or
+   * update dialog" from createGitSyncProject closing) - same stale-backdrop
+   * race as chooseGitProjectFolderForOpen(), so this needs the same guard.
+   */
+  async moveRepositoryToAnotherFolder(): Promise<void> {
+    await this.clickReliably(this.page.getByRole('button', { name: 'Move repository to another folder' }));
+  }
+
+  // ===========================================================================
+  // Import Operations
+  // ===========================================================================
+
+  /**
+   * Import a fixture file from clipboard.
+   * This is the most common operation in tests.
+   */
+  async importFixture(fixturePath: string): Promise<void> {
+    const text = await loadFixture(fixturePath);
+    await this.app.evaluate(async ({ clipboard }, text) => clipboard.writeText(text), text);
+
+    await this.root.getByLabel('Import').click();
+    await this.page.locator('[data-test-id="import-from-clipboard"]').click();
+    await this.scanButton.click();
+    await this.page.getByRole('dialog').getByRole('button', { name: 'Import' }).click();
+    await this.page.getByRole('dialog').waitFor({ state: 'hidden' });
+    // After import the app either navigates into the workspace (single collection)
+    // or stays on the project page (multiple collections). 2 s is enough to detect navigation.
+    await this.page
+      .getByTestId('workspace-breadcrumb-level-0')
+      .waitFor({ state: 'visible', timeout: 2000 })
+      .catch(() => {});
+  }
+
+  /**
+   * Imports multiple fixture files into the project via clipboard.
+   * After each import, navigates back to the project page to continue importing.
+   * @param fixturePaths - Array of paths relative to fixtures directory
+   */
+  async importMultipleFixtures(fixturePaths: string[]): Promise<void> {
+    for (const fixturePath of fixturePaths) {
+      const content = await loadFixture(fixturePath);
+      await this.importFixture(fixturePath);
+
+      // After import, app redirects to workspace page
+      // Navigate back to project page for next import or to continue testing
+      await this.page.getByTestId('workspace-breadcrumb-level-0').waitFor({ state: 'visible' });
+      await this.page.getByTestId('workspace-breadcrumb-level-0').click();
+    }
+  }
+
+  /**
+   * Exports a workspace from the workspace card dropdown.
+   * Note: After calling this method, use waitForExportFiles() utility to ensure the file is written.
+   * @param workspaceName - The name of the workspace to export
+   * @param exportPath - The absolute path where the file should be exported
+   * @param format - The export format ('yaml' or 'har')
+   */
+  async exportWorkspaceFromCard(
+    workspaceName: string,
+    exportPath: string,
+    format: 'yaml' | 'har' = 'yaml',
+  ): Promise<void> {
+    // Mock the save dialog first
+    await mockSaveDialogForFile(this.app, exportPath);
+
+    // Open workspace card dropdown
+    await this.workspaceList.openWorkspaceCardDropdown(workspaceName);
+
+    // Click Export option
+    await this.page.getByRole('menuitem', { name: 'Export', exact: true }).click();
+
+    // Click Export button in the export requests modal (all requests selected by default)
+    await this.page.getByRole('dialog').getByRole('button', { name: 'Export' }).click();
+
+    // Select export format
+    await this.exportModal.selectExportFormat(format);
+  }
+
+  /**
+   * Exports all workspaces in a project via the sidebar project actions dropdown.
+   * Mirrors the Preferences > Data tab export, but triggered from the project context menu.
+   * Note: After calling this method, use waitForExportFiles() utility to ensure files are written.
+   * @param projectName - The name of the project to export
+   * @param exportPath - The directory (yaml) or file (har) path used to mock the save dialog
+   * @param format - The export format ('yaml' or 'har')
+   */
+  async exportProjectFromSidebar(
+    projectName: string,
+    exportPath: string,
+    format: 'yaml' | 'har' = 'yaml',
+  ): Promise<void> {
+    await this.sidebar.selectProjectDropdownOption({ actionName: 'Export', projectName });
+    if (format === 'yaml') {
+      await mockOpenDialogForDirectory(this.app, exportPath);
+    } else if (format === 'har') {
+      await mockSaveDialogForFile(this.app, exportPath);
+    }
+    await this.exportModal.selectExportFormat(format);
+  }
+}

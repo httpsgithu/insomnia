@@ -1,0 +1,50 @@
+import type { SettingsOfType } from 'insomnia-data/common';
+import React, { type PropsWithChildren, type ReactNode } from 'react';
+
+import { useRootLoaderData } from '~/ui/hooks/use-root-loader-data';
+
+import { useSettingsPatcher } from '../../hooks/use-request';
+import { HelpTooltip } from '../help-tooltip';
+interface Props<T> {
+  help?: ReactNode;
+  label: string;
+  setting: SettingsOfType<string>;
+  values: {
+    name: string;
+    value: T;
+  }[];
+  disabled?: boolean;
+}
+
+export const EnumSetting = <T extends string | number>({
+  help,
+  label,
+  setting,
+  values,
+  disabled = false,
+}: PropsWithChildren<Props<T>>) => {
+  const { settings } = useRootLoaderData()!;
+
+  const patchSettings = useSettingsPatcher();
+
+  return (
+    <div className="form-control form-control--outlined">
+      <label>
+        {label}
+        {help && <HelpTooltip className="space-left">{help}</HelpTooltip>}
+        <select
+          value={String(settings[setting]) || '__NULL__'}
+          name={setting}
+          onChange={event => patchSettings({ [setting]: event.currentTarget.value })}
+          disabled={disabled}
+        >
+          {values.map(({ name, value }) => (
+            <option key={value} value={value}>
+              {name}
+            </option>
+          ))}
+        </select>
+      </label>
+    </div>
+  );
+};

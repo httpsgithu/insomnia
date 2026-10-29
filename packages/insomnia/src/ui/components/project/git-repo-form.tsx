@@ -1,0 +1,414 @@
+import type { GitCredentials, ProviderEmail } from 'insomnia-data';
+import { models } from 'insomnia-data';
+import { type FC, Fragment, useEffect, useState } from 'react';
+import {
+  Button,
+  Form,
+  Label,
+  ListBox,
+  ListBoxItem,
+  Popover,
+  Select,
+  SelectValue,
+  Separator,
+} from 'react-aria-components';
+
+import { Icon } from '~/basic-components/icon';
+import { useAllConnectedReposLoaderFetcher } from '~/routes/git.all-connected-repos';
+import type { useGitProjectInitCloneActionFetcher } from '~/routes/git.init-clone';
+import { useGitValidateCredentialFetcher } from '~/routes/git.validate-credential';
+import type { GitProviderOption } from '~/sync/git/providers/types';
+import { ensureGitRepoUrlSuffix } from '~/sync/git/url-utils';
+import { Checkbox } from '~/ui/components/base/checkbox';
+import { Input } from '~/ui/components/base/input';
+import { MiddleTruncate } from '~/ui/components/base/middle-truncate';
+import { GitOauthAuthBanner } from '~/ui/components/git/git-oauth-auth-banner';
+import { GitCredentialSetup } from '~/ui/components/git-credentials/credential-setup';
+import { GitRemoteBranchSelect } from '~/ui/components/git-credentials/git-remote-branch-select';
+import { GitRepositorySelect } from '~/ui/components/git-credentials/git-repository-select';
+import { showSettingsModal } from '~/ui/components/modals/settings-modal';
+import { selectFileOrFolder } from '~/ui/utils/select-file-or-folder';
+
+import { ErrorBoundary } from '../error-boundary';
+import {
+  type ActiveView,
+  deriveRepoName,
+  getLastCloneParentDir,
+  type ProjectData,
+  resolveCloneFolderName,
+  setLastCloneParentDir,
+} from './utils';
+
+const { isGitCredentialsV2, isOAuthCredential } = models.gitCredentials;
+
+const validateRepoUrl = (value: string): string | null => {
+  try {
+    const { protocol } = new URL(value.trim());
+    if (protocol !== 'http:' && protocol !== 'https:') {
+      return 'Enter a valid URL to a remote git repo';
+    }
+    return null;
+  } catch {
+    return 'Enter a valid URL to a remote git repo';
+  }
+};
+
+const getCredentialEmails = (credential: GitCredentials | undefined) => {
+  if (credential && isGitCredentialsV2(credential) && isOAuthCredential(credential)) {
+    return credential.credentials?.emails || [];
+  }
+  return [];
+};
+
+interface Props {
+  setProjectData: React.Dispatch<React.SetStateAction<ProjectData>>;
+  projectData: ProjectData;
+  initCloneGitRepositoryFetcher: ReturnType<typeof useGitProjectInitCloneActionFetcher>;
+  organizationId: string;
+  setActiveView: React.Dispatch<React.SetStateAction<ActiveView>>;
+  credentials: GitCredentials[];
+  providers: GitProviderOption[];
+  formId: string;
+  onCredentialValidationChange?: (isInvalid: boolean) => void;
+}
+
+export const GitRepoForm: FC<Props> = ({
+  setProjectData,
+  projectData,
+  initCloneGitRepositoryFetcher,
+  organizationId,
+  setActiveView,
+  credentials,
+  providers,
+  formId,
+  onCredentialValidationChange,
+}) => {
+  const allConnectedReposLoaderFetcher = useAllConnectedReposLoaderFetcher();
+  const allConnectedReposLoaderFetcherLoad = allConnectedReposLoaderFetcher.load;
+
+  useEffect(() => {
+    allConnectedReposLoaderFetcherLoad();
+  }, [allConnectedReposLoaderFetcherLoad]);
+
+  const allConnectedRepoURIInfoMap = allConnectedReposLoaderFetcher.data;
+
+  const [isCredentialSelectOpen, setIsCredentialSelectOpen] = useState(false);
+  const validateCredentialFetcher = useGitValidateCredentialFetcher();
+
+  const selectedCredentialsId = projectData.credentialsId || credentials?.[0]?._id;
+  const selectedCredential = credentials.find(c => c._id === selectedCredentialsId);
+  const selectedProvider = providers.find(p => p.type === selectedCredential?.provider);
+  const needToSetupCredentials = credentials.length === 0;
+
+  const availableEmails = getCredentialEmails(selectedCredential);
+  const showEmailSelector = availableEmails.length > 1;
+  const [isEmailSelectOpen, setIsEmailSelectOpen] = useState(false);
+
+  const isCredentialInvalid =
+    (validateCredentialFetcher.state !== 'idle' && !validateCredentialFetcher.data) ||
+    Boolean(
+      validateCredentialFetcher.data &&
+        'errors' in validateCredentialFetcher.data &&
+        validateCredentialFetcher.data.errors,
+    );
+
+  useEffect(() => {
+    onCredentialValidationChange?.(isCredentialInvalid);
+  }, [isCredentialInvalid, onCredentialValidationChange]);
+
+  return (
+    <ErrorBoundary>
+      <Checkbox
+        isSelected={projectData.connectRepositoryLater}
+        onChange={isSelected => setProjectData(prev => ({ ...prev, connectRepositoryLater: isSelected }))}
+        className="w-fit"
+      >
+        Connect repository later
+      </Checkbox>
+
+      {needToSetupCredentials && !projectData.connectRepositoryLater && <GitCredentialSetup providers={providers} />}
+
+      {!needToSetupCredentials && !projectData.connectRepositoryLater && (
+        <Form
+          aria-label="Git Setup Form"
+          id={formId}
+          className="flex flex-col gap-3"
+          onSubmit={async e => {
+            e.preventDefault();
+            const formData = new FormData(e.currentTarget);
+            const credentialsId = formData.get('credentialsId') as string;
+            const ref = formData.get('branch') as string;
+            const fullUri = ensureGitRepoUrlSuffix((formData.get('uri') as string) || '');
+            setProjectData({
+              ...projectData,
+              credentialsId,
+              uri: fullUri,
+              ref,
+            });
+            initCloneGitRepositoryFetcher.submit({
+              credentialsId,
+              uri: fullUri || '',
+              ref,
+              organizationId,
+            });
+
+            setActiveView('git-results');
+          }}
+        >
+          <Select
+            onOpenChange={setIsCredentialSelectOpen}
+            isOpen={isCredentialSelectOpen}
+            aria-label="Git Credentials"
+            name="credentialsId"
+            onSelectionChange={id => {
+              const newCredentialsId = id as string;
+              setProjectData(prev => ({ ...prev, credentialsId: newCredentialsId }));
+              validateCredentialFetcher.load({ credentialsId: newCredentialsId });
+            }}
+            defaultSelectedKey={credentials?.[0]?._id}
+          >
+            <Label className="mb-1 pt-0 text-sm">Authorized as</Label>
+            <Button className="flex h-(--line-height-xs) w-full flex-1 items-center justify-between gap-2 rounded-xs border border-solid border-(--hl-sm) bg-(--color-bg) px-2 text-(--color-font) ring-1 ring-transparent transition-colors placeholder:italic hover:bg-(--hl-xs) focus:ring-1 focus:ring-(--hl-md) focus:outline-hidden focus:ring-inset aria-pressed:bg-(--hl-sm)">
+              <SelectValue<GitCredentials> className="flex items-center justify-center gap-2 truncate">
+                {({ selectedItem }) => {
+                  if (selectedItem) {
+                    const provider = providers.find(p => p.type === selectedItem.provider);
+
+                    return (
+                      <Fragment>
+                        {provider?.iconName && <Icon icon={provider.iconName} className="size-4" />}
+                        <span>{provider?.displayName}</span>
+                        <Separator orientation="vertical" className="mx-2 h-4 border-l border-(--color-font)" />
+                        <span className="truncate">{selectedItem.author?.name}</span>
+                      </Fragment>
+                    );
+                  }
+
+                  return 'Select a Credential';
+                }}
+              </SelectValue>
+              <Icon icon="caret-down" />
+            </Button>
+            <Popover className="isolate flex w-(--trigger-width) min-w-max flex-col overflow-hidden rounded-md border border-solid border-(--hl-sm) bg-(--color-bg) text-sm shadow-lg select-none">
+              <ListBox items={credentials} className="min-w-max overflow-y-auto py-2 focus:outline-hidden">
+                {item => (
+                  <ListBoxItem
+                    id={item._id}
+                    key={item._id}
+                    className="flex h-(--line-height-xs) w-full items-center gap-2 bg-transparent px-(--padding-md) whitespace-nowrap text-(--color-font) transition-colors hover:bg-(--hl-sm) focus:bg-(--hl-xs) focus:outline-hidden disabled:cursor-not-allowed aria-selected:font-bold"
+                    aria-label={item.name}
+                    textValue={item.name}
+                    value={item}
+                  >
+                    {({ isSelected }) => {
+                      const provider = providers.find(p => p.type === item.provider);
+
+                      return (
+                        <Fragment>
+                          {provider?.iconName && <Icon icon={provider.iconName} className="size-4" />}
+                          <span>{provider?.displayName}</span>
+                          <Separator orientation="vertical" className="mx-2 h-4 border-l border-(--color-font)" />
+                          <span className="truncate">{item.author?.name}</span>
+                          {isSelected && <Icon icon="check" className="justify-self-end text-(--color-success)" />}
+                        </Fragment>
+                      );
+                    }}
+                  </ListBoxItem>
+                )}
+              </ListBox>
+              <div className="w-(--trigger-width) bg-(--hl-xs) p-4 text-sm text-(--color-font)">
+                <span className="font-bold">Need to add another credential? </span>
+                <span>Login with Github or GitLab, or manually add access tokens in </span>
+                <Button
+                  onPress={() => {
+                    setIsCredentialSelectOpen(false);
+                    showSettingsModal({ tab: 'credentials' });
+                  }}
+                  className="underline"
+                >
+                  {'Preferences > Credentials.'}
+                </Button>
+              </div>
+            </Popover>
+          </Select>
+          {validateCredentialFetcher.state !== 'idle' && !validateCredentialFetcher.data && (
+            <div className="flex items-center gap-2 text-sm">
+              <Icon icon="spinner" className="animate-spin" />
+              <span>Validating credential...</span>
+            </div>
+          )}
+          {selectedProvider && (
+            <GitOauthAuthBanner
+              selectedCredential={selectedCredential}
+              provider={selectedProvider}
+              repoLoadErrors={
+                validateCredentialFetcher.state === 'idle' &&
+                validateCredentialFetcher.data &&
+                'errors' in validateCredentialFetcher.data
+                  ? validateCredentialFetcher.data.errors
+                  : undefined
+              }
+            />
+          )}
+          {showEmailSelector && !isCredentialInvalid && (
+            <Select
+              onOpenChange={setIsEmailSelectOpen}
+              isOpen={isEmailSelectOpen}
+              aria-label="Author Email"
+              selectedKey={projectData.selectedAuthorEmail || selectedCredential?.author?.email}
+              onSelectionChange={email => {
+                setProjectData(prev => ({
+                  ...prev,
+                  selectedAuthorEmail: email,
+                }));
+              }}
+            >
+              <Label className="mb-1 pt-0 text-sm">Author Email</Label>
+              <Button className="flex h-(--line-height-xs) w-full flex-1 items-center justify-between gap-2 rounded-xs border border-solid border-(--hl-sm) bg-(--color-bg) px-2 text-(--color-font) ring-1 ring-transparent transition-colors placeholder:italic hover:bg-(--hl-xs) focus:ring-1 focus:ring-(--hl-md) focus:outline-hidden focus:ring-inset aria-pressed:bg-(--hl-sm)">
+                <SelectValue<ProviderEmail> className="flex items-center justify-center gap-2 truncate">
+                  {({ selectedItem }) => {
+                    if (selectedItem) {
+                      return (
+                        <Fragment>
+                          <span>{selectedItem.email}</span>
+                          {selectedItem.primary && <span className="text-xs text-(--hl-lg)">(primary)</span>}
+                        </Fragment>
+                      );
+                    }
+                    return projectData.selectedAuthorEmail || selectedCredential?.author?.email || 'Select an email';
+                  }}
+                </SelectValue>
+                <Icon icon="caret-down" />
+              </Button>
+              <Popover className="isolate flex w-(--trigger-width) min-w-max flex-col overflow-hidden rounded-md border border-solid border-(--hl-sm) bg-(--color-bg) text-sm shadow-lg select-none">
+                <ListBox items={availableEmails} className="min-w-max overflow-y-auto py-2 focus:outline-hidden">
+                  {item => (
+                    <ListBoxItem
+                      id={item.email}
+                      key={item.email}
+                      className="flex h-(--line-height-xs) w-full items-center gap-2 bg-transparent px-(--padding-md) whitespace-nowrap text-(--color-font) transition-colors hover:bg-(--hl-sm) focus:bg-(--hl-xs) focus:outline-hidden disabled:cursor-not-allowed aria-selected:font-bold"
+                      aria-label={item.email}
+                      textValue={item.email}
+                      value={item}
+                    >
+                      {({ isSelected }) => (
+                        <Fragment>
+                          <span>{item.email}</span>
+                          {item.primary && <span className="text-xs text-(--hl-lg)">(primary)</span>}
+                          {isSelected && <Icon icon="check" className="justify-self-end text-(--color-success)" />}
+                        </Fragment>
+                      )}
+                    </ListBoxItem>
+                  )}
+                </ListBox>
+              </Popover>
+            </Select>
+          )}
+          {selectedProvider && (
+            <div className={isCredentialInvalid ? 'hidden' : ''}>
+              {selectedProvider.supportsFetchRepos ? (
+                <GitRepositorySelect
+                  allConnectedRepoURIInfoMap={allConnectedRepoURIInfoMap}
+                  uri={projectData.uri || ''}
+                  onSelect={(uri: string) =>
+                    setProjectData(prev => ({
+                      ...prev,
+                      uri,
+                    }))
+                  }
+                  credentialsId={selectedCredentialsId}
+                  providerType={selectedProvider.type}
+                />
+              ) : (
+                <Input
+                  label="Repository URL"
+                  description={'Enter the URL to the remote repo that includes ".git" at the end.'}
+                  key={selectedCredentialsId}
+                  defaultValue={projectData.uri}
+                  name="uri"
+                  type="url"
+                  isRequired
+                  placeholder="e.g. https://github.com/organization/repo-name.git"
+                  validate={validateRepoUrl}
+                  errorMessage="Enter a valid URL to a remote git repo"
+                  onChange={v => {
+                    setProjectData(prev => ({ ...prev, uri: ensureGitRepoUrlSuffix(v) }));
+                  }}
+                />
+              )}
+            </div>
+          )}
+
+          <div className={isCredentialInvalid ? 'hidden' : ''}>
+            <GitRemoteBranchSelect
+              credentialsId={selectedCredentialsId}
+              url={projectData.uri || ''}
+              isDisabled={false}
+            />
+          </div>
+
+          <div className={isCredentialInvalid ? 'hidden' : 'flex flex-col gap-3 px-0.5'}>
+            <div className="flex flex-col gap-2">
+              <Label className="text-sm text-(--color-font)">Clone location</Label>
+              <div className="flex items-center gap-2">
+                {projectData.cloneParentDir ? (
+                  <MiddleTruncate
+                    value={window.path.join(
+                      projectData.cloneParentDir,
+                      resolveCloneFolderName(projectData.cloneFolderName, projectData.uri),
+                    )}
+                    className="h-(--line-height-xs) flex-1 rounded-xs border border-solid border-(--hl-sm) bg-(--color-bg) px-2 text-(--color-font)"
+                  />
+                ) : (
+                  <div className="flex h-(--line-height-xs) flex-1 items-center truncate rounded-xs border border-solid border-(--hl-sm) bg-(--color-bg) px-2 text-(--color-font)">
+                    Managed by Insomnia (default location)
+                  </div>
+                )}
+                <Button
+                  type="button"
+                  onPress={async () => {
+                    const defaultPath =
+                      projectData.cloneParentDir ||
+                      getLastCloneParentDir() ||
+                      window.path.join(window.app.getPath('home'), 'Insomnia');
+                    const { canceled, filePath } = await selectFileOrFolder({
+                      itemTypes: ['directory'],
+                      defaultPath,
+                    });
+                    if (canceled || !filePath) {
+                      return;
+                    }
+                    setLastCloneParentDir(filePath);
+                    setProjectData(prev => ({ ...prev, cloneParentDir: filePath }));
+                  }}
+                  className="flex h-(--line-height-xs) items-center justify-center gap-2 rounded-xs border border-solid border-(--hl-md) px-3 text-sm text-(--color-font) transition-colors hover:bg-(--hl-xs) aria-pressed:bg-(--hl-xs)"
+                >
+                  Choose folder…
+                </Button>
+                {projectData.cloneParentDir && (
+                  <Button
+                    type="button"
+                    onPress={() => setProjectData(prev => ({ ...prev, cloneParentDir: undefined, cloneFolderName: undefined }))}
+                    className="flex h-(--line-height-xs) items-center justify-center gap-2 rounded-xs border border-solid border-(--hl-md) px-3 text-sm text-(--color-font) transition-colors hover:bg-(--hl-xs) aria-pressed:bg-(--hl-xs)"
+                  >
+                    Use default
+                  </Button>
+                )}
+              </div>
+            </div>
+            {projectData.cloneParentDir && (
+              <Input
+                label="Folder name"
+                description="The name of the folder created inside the clone location above."
+                value={projectData.cloneFolderName ?? deriveRepoName(projectData.uri)}
+                name="cloneFolderName"
+                placeholder={deriveRepoName(projectData.uri)}
+                onChange={v => setProjectData(prev => ({ ...prev, cloneFolderName: v.replace(/[/\\]/g, '') }))}
+              />
+            )}
+          </div>
+        </Form>
+      )}
+    </ErrorBoundary>
+  );
+};

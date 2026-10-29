@@ -1,0 +1,499 @@
+import type { IconName, IconProp } from '@fortawesome/fontawesome-svg-core';
+import classNames from 'classnames';
+import {
+  exportGlobalEnvironmentToFile,
+  exportMcpClientToFile,
+  exportMockServerToFile,
+  exportSpecificationToFile,
+} from 'insomnia/src/ui/components/settings/import-export';
+import type { MockServer, Project, Workspace } from 'insomnia-data';
+import { models, services } from 'insomnia-data';
+import type { PlatformKeyCombinations } from 'insomnia-data/common';
+import React, { Fragment, useCallback, useEffect, useState } from 'react';
+import {
+  Button,
+  Collection,
+  Header,
+  Menu,
+  MenuItem,
+  MenuSection,
+  MenuTrigger,
+  Popover,
+  SubmenuTrigger,
+} from 'react-aria-components';
+
+import { database as db } from '~/common/database';
+import type { SerializableActionMeta } from '~/common/plugins/bridge-types';
+import { useRequestNewActionFetcher } from '~/routes/organization.$organizationId.project.$projectId.workspace.$workspaceId.debug.request.new';
+import { useRequestGroupNewActionFetcher } from '~/routes/organization.$organizationId.project.$projectId.workspace.$workspaceId.debug.request-group.new';
+import { useTabNavigate } from '~/ui/hooks/use-insomnia-tab';
+import type { CreateRequestType } from '~/ui/hooks/use-request';
+import { plugins } from '~/ui/plugins/renderer-bridge';
+
+import { getProductName, SORT_ORDERS, type SortOrder, sortOrderName } from '../../../common/constants';
+import { AnalyticsEvent } from '../../analytics';
+import { DropdownHint } from '../base/dropdown/dropdown-hint';
+import { Icon } from '../icon';
+import { showError, showModal } from '../modals';
+import { ExportRequestsModal } from '../modals/export-requests-modal';
+import { ImportModal } from '../modals/import-modal/import-modal';
+import { PasteCurlModal } from '../modals/paste-curl-modal';
+import { PromptModal } from '../modals/prompt-modal';
+import { WorkspaceDuplicateModal } from '../modals/workspace-duplicate-modal';
+import { WorkspaceSettingsModal } from '../modals/workspace-settings-modal';
+import { createRequestOrFolderActionItems } from './actions/create-actions';
+
+interface Props {
+  workspace: Workspace;
+  project: Project;
+  organizationId: string;
+  sortOrder?: SortOrder;
+  onSortOrderChange: (newSortOrder: SortOrder) => void;
+  isOpen: boolean;
+  forceShowTrigger?: boolean;
+  onOpenChange: (isOpen: boolean) => void;
+  onRename: () => void;
+  onDelete: () => void;
+}
+
+interface ActionItem {
+  id: string;
+  name: string;
+  icon: IconProp;
+  hint?: PlatformKeyCombinations;
+  action: () => void;
+  className?: string;
+  hasSubmenu?: boolean;
+  submenuItems?: Omit<ActionItem, 'icon'>[];
+}
+
+interface ActionSection {
+  name: string;
+  id: string;
+  icon: IconName;
+  items: ActionItem[];
+}
+
+export const SidebarWorkspaceDropdown = ({
+  workspace,
+  project,
+  organizationId,
+  sortOrder,
+  onSortOrderChange,
+  isOpen,
+  onOpenChange,
+  forceShowTrigger = false,
+  onRename,
+  onDelete,
+}: Props) => {
+  const projectId = project._id;
+  const workspaceId = workspace._id;
+
+  const [isDuplicateModalOpen, setIsDuplicateModalOpen] = useState(false);
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
+  const [settingsData, setSettingsData] = useState<{ mockServer: MockServer | null; gitFilePath: string | null }>();
+  const [isPasteCurlModalOpen, setPasteCurlModalOpen] = useState(false);
+  const [actionPlugins, setActionPlugins] = useState<SerializableActionMeta[]>([]);
+
+  const newRequestFetcher = useRequestNewActionFetcher();
+  const newRequestGroupFetcher = useRequestGroupNewActionFetcher();
+
+  const tabNavigate = useTabNavigate();
+
+  const workspaceName = workspace.name;
+  const projectName = project.name || getProductName();
+  // Legacy design workspace is treated as collection for now.
+  const isCollectionLike = models.workspace.isCollection(workspace) || models.workspace.isDesign(workspace);
+  const isScratchpadWorkspace = models.workspace.isScratchpad(workspace);
+
+  const createRequest = (requestType: CreateRequestType) => {
+    newRequestFetcher.submit({
+      organizationId,
+      projectId,
+      workspaceId,
+      requestType,
+      parentId: workspaceId,
+    });
+  };
+
+  const openInNewTab = (isRunner = false) => {
+    tabNavigate(
+      { organization: organizationId, project, workspace, item: workspace },
+      isRunner ? { shouldNavigate: true, asRunner: true } : { withTab: true, shouldNavigate: true },
+    );
+  };
+
+  const handleDropdownOpen = useCallback(async () => {
+    try {
+      const actionPlugins = await plugins.getWorkspaceActions();
+      setActionPlugins(actionPlugins);
+    } catch (error) {
+      setActionPlugins([]);
+      console.error('Failed to get workspace plugin actions', error);
+    }
+  }, []);
+
+  useEffect(() => {
+    // Fetch the action plugins when the dropdown is opened
+    if (isOpen) {
+      handleDropdownOpen();
+    }
+  }, [isOpen, handleDropdownOpen]);
+
+  const handlePluginClick = async ({ pluginName, label }: SerializableActionMeta) => {
+    try {
+      const docs = await db.getWithDescendants(workspace, [models.request.type, models.requestGroup.type]);
+      const requests = docs.filter(models.request.isRequest).filter(doc => !doc.isPrivate);
+      const requestGroups = docs.filter(models.requestGroup.isRequestGroup);
+      await plugins.executeAction({
+        type: 'workspace',
+        pluginName,
+        label,
+        projectId: project._id,
+        domainData: { workspace, requests, requestGroups },
+      });
+    } catch (error) {
+      showError({
+        title: 'Plugin Action Failed',
+        error,
+      });
+    }
+  };
+
+  const createSection: ActionSection = {
+    name: 'Create',
+    id: 'create',
+    icon: 'plus',
+    items: createRequestOrFolderActionItems({
+      createRequest,
+      createFolder: () =>
+        showModal(PromptModal, {
+          title: 'New Folder',
+          defaultValue: 'My Folder',
+          submitName: 'Create',
+          label: 'Name',
+          selectText: true,
+          onComplete: (name: string) =>
+            newRequestGroupFetcher.submit({
+              organizationId,
+              projectId,
+              workspaceId,
+              parentId: workspaceId,
+              name,
+            }),
+        }),
+      folderFirst: false,
+    }),
+  };
+
+  const importSection: ActionSection = {
+    name: 'Import',
+    id: 'import-create',
+    icon: 'file-import',
+    items: [
+      {
+        id: 'From Curl',
+        name: 'From Curl',
+        icon: 'terminal',
+        action: () => setPasteCurlModalOpen(true),
+      },
+      {
+        id: 'from-file',
+        name: 'From File',
+        icon: 'file-import',
+        action: () => setIsImportModalOpen(true),
+      },
+    ],
+  };
+
+  const runSection: ActionSection = {
+    name: 'Run',
+    id: 'run',
+    icon: 'circle-play',
+    items: [
+      {
+        id: 'RunCollection',
+        name: 'Run API Collection',
+        icon: 'circle-play',
+        action: () => openInNewTab(true),
+      },
+    ],
+  };
+
+  const createSections: ActionSection[] = [
+    ...(isCollectionLike ? [createSection, importSection] : []),
+    ...(isCollectionLike ? [runSection] : []),
+  ];
+
+  const actionSection: ActionSection = {
+    name: 'Actions',
+    id: 'actions',
+    icon: 'cog',
+    items: [
+      {
+        id: 'OpenInNewTab',
+        name: 'Open in New Tab',
+        icon: 'external-link-alt',
+        action: openInNewTab,
+      },
+      ...(!models.workspace.isMcp(workspace)
+        ? [
+            {
+              id: 'Duplicate',
+              name: 'Duplicate / Move',
+              icon: 'copy' as IconName,
+              action: () => setIsDuplicateModalOpen(true),
+            },
+          ]
+        : []),
+      ...(models.workspace.isCollection(workspace)
+        ? [
+            {
+              id: 'Sort',
+              name: 'Sort',
+              icon: 'sort' as IconName,
+              action: () => {},
+              hasSubmenu: true,
+              submenuItems: SORT_ORDERS.map(order => ({
+                id: order,
+                name: sortOrderName[order],
+                action: () => onSortOrderChange(order),
+              })),
+            },
+          ]
+        : []),
+      {
+        id: 'Rename',
+        name: 'Rename',
+        icon: 'pen-to-square' as IconName,
+        action: onRename,
+      },
+      {
+        id: 'Export',
+        name: 'Export',
+        icon: 'file-export',
+        action: () => {
+          window.main.trackAnalyticsEvent({
+            event: AnalyticsEvent.exportStarted,
+            properties: { source: `${workspace.scope}-list` },
+          });
+          if (workspace.scope === 'mock-server') {
+            return exportMockServerToFile(workspace);
+          }
+          if (workspace.scope === 'environment') {
+            return exportGlobalEnvironmentToFile(workspace);
+          }
+          if (workspace.scope === 'mcp') {
+            return exportMcpClientToFile(workspace);
+          }
+          return setIsExportModalOpen(true);
+        },
+      },
+      ...(isCollectionLike
+        ? [
+            {
+              id: 'ExportOpenApiSpec',
+              name: 'Export OpenAPI Spec',
+              icon: 'file-code' as IconName,
+              action: () => exportSpecificationToFile(workspace),
+            },
+          ]
+        : []),
+      {
+        id: 'Settings',
+        name: 'Settings',
+        icon: 'gear',
+        action: async () =>
+          setSettingsData({
+            mockServer: (await services.mockServer.getByParentId(workspaceId)) ?? null,
+            gitFilePath: (await services.workspaceMeta.getByParentId(workspaceId))?.gitFilePath ?? null,
+          }),
+      },
+      {
+        id: 'Delete',
+        name: 'Delete',
+        icon: 'trash',
+        className: 'text-(--color-danger)',
+        action: onDelete,
+      },
+    ],
+  };
+
+  const scratchpadActionList: ActionSection = {
+    name: 'Actions',
+    id: 'Actions',
+    icon: 'cog',
+    items: [
+      {
+        id: 'Export',
+        name: 'Export',
+        icon: 'file-export',
+        action: () => {
+          window.main.trackAnalyticsEvent({
+            event: AnalyticsEvent.exportStarted,
+            properties: { source: `${workspace.scope}-list` },
+          });
+          if (workspace.scope === 'mock-server') {
+            return exportMockServerToFile(workspace);
+          }
+          if (workspace.scope === 'environment') {
+            return exportGlobalEnvironmentToFile(workspace);
+          }
+          if (workspace.scope === 'mcp') {
+            return exportMcpClientToFile(workspace);
+          }
+          return setIsExportModalOpen(true);
+        },
+      },
+    ],
+  };
+
+  const pluginActionSection: ActionSection = {
+    name: 'Plugins',
+    id: 'plugins',
+    icon: 'plug' as IconName,
+    items: actionPlugins.map(plugin => ({
+      id: `${plugin.pluginName}:${plugin.label}`,
+      name: plugin.label,
+      icon: (plugin.icon as IconName) || 'plug',
+      action: () => handlePluginClick(plugin),
+    })),
+  };
+
+  const allSections: ActionSection[] = isScratchpadWorkspace
+    ? [...createSections, scratchpadActionList]
+    : [...createSections, actionSection, ...(actionPlugins.length > 0 ? [pluginActionSection] : [])];
+
+  return (
+    <Fragment>
+      <MenuTrigger isOpen={isOpen} onOpenChange={onOpenChange}>
+        <Button
+          aria-label="SideBar Workspace Actions"
+          className={classNames(
+            'flex aspect-square h-6 items-center justify-center rounded-xs text-sm text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) hover:opacity-100 focus:opacity-100 focus:ring-(--hl-md) focus:ring-inset aria-pressed:bg-(--hl-sm) data-pressed:visible data-pressed:opacity-100',
+            {
+              'visible opacity-100': forceShowTrigger,
+              'invisible opacity-0 group-hover:visible group-hover:opacity-100 group-focus:visible group-focus:opacity-100':
+                !forceShowTrigger,
+            },
+          )}
+        >
+          <Icon icon="ellipsis" />
+        </Button>
+        <Popover className="flex min-w-max flex-col overflow-y-hidden" placement="bottom end">
+          <Menu
+            aria-label="Workspace Actions Menu"
+            selectionMode="single"
+            onAction={key =>
+              allSections
+                .find(s => s.items.find(a => a.id === key))
+                ?.items.find(a => a.id === key)
+                ?.action()
+            }
+            items={allSections}
+            className="max-h-128 min-w-max overflow-y-auto rounded-md border border-solid border-(--hl-sm) bg-(--color-bg) py-2 text-sm shadow-lg select-none focus:outline-hidden"
+          >
+            {section => (
+              <MenuSection className="flex flex-1 flex-col">
+                <Header className="flex items-center gap-2 py-1 pl-2 text-xs text-(--hl) uppercase">
+                  <Icon icon={section.icon} /> <span>{section.name}</span>
+                </Header>
+                <Collection items={section.items}>
+                  {item =>
+                    !item.hasSubmenu ? (
+                      <MenuItem
+                        key={item.id}
+                        id={item.id}
+                        className={`flex h-(--line-height-xs) w-full items-center gap-2 bg-transparent px-(--padding-md) whitespace-nowrap text-(--color-font) transition-colors hover:bg-(--hl-sm) focus:bg-(--hl-xs) focus:outline-hidden disabled:cursor-not-allowed aria-selected:font-bold ${item.className ? ` ${item.className}` : ''}`}
+                        aria-label={item.name}
+                      >
+                        <Icon icon={item.icon} className="h-4 w-3" />
+                        <span>{item.name}</span>
+                        {item.hint && <DropdownHint keyBindings={item.hint} />}
+                      </MenuItem>
+                    ) : (
+                      <SubmenuTrigger>
+                        <MenuItem
+                          className={`flex h-(--line-height-xs) w-full items-center gap-2 bg-transparent px-(--padding-md) whitespace-nowrap text-(--color-font) transition-colors hover:bg-(--hl-sm) focus:bg-(--hl-xs) focus:outline-hidden disabled:cursor-not-allowed aria-selected:font-bold ${item.className ? ` ${item.className}` : ''}`}
+                          aria-label={item.name}
+                        >
+                          <Icon icon={item.icon} className="h-4 w-3" />
+                          <span>{item.name}</span>
+                          <Icon icon="chevron-right" className="ml-auto" />
+                        </MenuItem>
+                        <Popover className="flex min-w-max flex-col overflow-y-hidden">
+                          <Menu
+                            aria-label={`${item.name} submenu`}
+                            onAction={key => item.submenuItems?.find(s => s.id === key)?.action()}
+                            items={item.submenuItems}
+                            className="min-w-max overflow-y-auto rounded-md border border-solid border-(--hl-sm) bg-(--color-bg) py-2 text-sm shadow-lg select-none focus:outline-hidden"
+                          >
+                            {subItem => (
+                              <MenuItem
+                                id={subItem.id}
+                                className="flex h-(--line-height-xs) w-full items-center gap-2 bg-transparent px-(--padding-md) whitespace-nowrap text-(--color-font) transition-colors hover:bg-(--hl-sm) focus:bg-(--hl-xs) focus:outline-hidden disabled:cursor-not-allowed aria-selected:font-bold"
+                                aria-label={subItem.name}
+                              >
+                                <span>{subItem.name}</span>
+                                {sortOrder === subItem.id && (
+                                  <Icon icon="check" className="h-4 w-3 justify-self-end text-(--color-success)" />
+                                )}
+                              </MenuItem>
+                            )}
+                          </Menu>
+                        </Popover>
+                      </SubmenuTrigger>
+                    )
+                  }
+                </Collection>
+              </MenuSection>
+            )}
+          </Menu>
+        </Popover>
+      </MenuTrigger>
+
+      {isDuplicateModalOpen && (
+        <WorkspaceDuplicateModal workspace={workspace} onHide={() => setIsDuplicateModalOpen(false)} />
+      )}
+      {isImportModalOpen && (
+        <ImportModal
+          onHide={() => setIsImportModalOpen(false)}
+          from={{ type: 'file' }}
+          projectName={projectName}
+          workspaceName={workspaceName}
+          organizationId={organizationId}
+          defaultProjectId={projectId}
+          defaultWorkspaceId={workspaceId}
+        />
+      )}
+      {isExportModalOpen && (
+        <ExportRequestsModal workspaceIdToExport={workspaceId} onClose={() => setIsExportModalOpen(false)} />
+      )}
+      {settingsData && (
+        <WorkspaceSettingsModal
+          workspace={workspace}
+          mockServer={settingsData.mockServer}
+          gitFilePath={settingsData.gitFilePath}
+          project={project}
+          onClose={() => setSettingsData(undefined)}
+        />
+      )}
+      {isPasteCurlModalOpen && (
+        <PasteCurlModal
+          onImport={req => {
+            newRequestFetcher.submit({
+              organizationId,
+              projectId,
+              workspaceId,
+              requestType: 'From Curl',
+              parentId: workspaceId,
+              req,
+            });
+          }}
+          onHide={() => setPasteCurlModalOpen(false)}
+        />
+      )}
+    </Fragment>
+  );
+};
