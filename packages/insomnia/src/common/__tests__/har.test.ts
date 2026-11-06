@@ -1,0 +1,711 @@
+import path from 'node:path';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('~/common/runtime', () => ({
+  getRuntime: () => ({
+    network: {
+      getTimelinePath: () => Promise.resolve(''),
+      appendToTimelineOnError: () => Promise.resolve(),
+      appendTimelineLines: () => Promise.resolve(),
+      getAuthHeader: () => Promise.resolve(),
+      executeCurlRequest: () => Promise.resolve({}),
+      runScript: () => Promise.resolve({}),
+      applyRequestHooks: (request: any) => Promise.resolve(request),
+      applyResponseHooks: (response: any) => Promise.resolve(response),
+    },
+    crypto: {
+      decryptSecretValue: (value: any) => Promise.resolve(value),
+      encryptSecretValue: (value: any) => Promise.resolve(value),
+      decryptAES: (_symmetricKey: any, encryptedResult: any) => Promise.resolve(encryptedResult),
+    },
+    templating: {
+      renderTemplate: async (input: any) => (typeof input.input === 'string' ? input.input : null),
+    },
+  }),
+}));
+
+import type { Cookie, Request, Response } from 'insomnia-data';
+import { models, services } from 'insomnia-data';
+import { EnvironmentKvPairDataType } from 'insomnia-data';
+
+import { database as db } from '../../common/database';
+import { getRenderedRequestAndContext } from '../../common/render';
+import type { RenderedRequest } from '../../common/templating/types';
+import { exportHar, exportHarResponse, exportHarWithRenderedRequest, exportHarWithRequest } from '../../main/har';
+
+let cookieBridge: any;
+
+describe('export', () => {
+  beforeEach(async () => {
+    cookieBridge = {
+      fromJSON: vi.fn(),
+      parse: vi.fn().mockResolvedValue(null),
+      toString: vi.fn(),
+      getCookiesForUrl: vi.fn().mockResolvedValue([]),
+      addSetCookies: vi.fn().mockResolvedValue({ cookies: [], rejectedCookies: [] }),
+    };
+    vi.stubGlobal('window', {
+      main: {
+        cookies: cookieBridge,
+      },
+    });
+    await db.init({ inMemoryOnly: true }, true);
+    await services.project.list();
+    await services.settings.getOrCreate();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  describe('exportHar()', () => {
+    it('exports single requests', async () => {
+      const wrk = await services.workspace.create({
+        _id: 'wrk_1',
+        name: 'Workspace',
+      });
+      const req1 = await services.request.create({
+        _id: 'req_1',
+        name: 'Request 1',
+        parentId: wrk._id,
+        url: 'https://httpstat.us/200',
+        method: 'POST',
+        body: {
+          mimeType: 'application/json',
+          text: '{}',
+        },
+        headers: [
+          {
+            name: 'Accept',
+            value: 'application/json',
+          },
+          {
+            name: 'Content-Type',
+            value: 'application/json',
+            disabled: false,
+          },
+          {
+            name: 'X-Disabled',
+            value: 'X-Disabled',
+            disabled: true,
+          },
+        ],
+      });
+      await services.response.create({
+        parentId: req1._id,
+        statusCode: 200,
+        statusMessage: 'OK',
+        elapsedTime: 999,
+        headers: [
+          {
+            name: 'Content-Type',
+            value: 'application/json',
+          },
+        ],
+        contentType: 'application/json',
+        bodyPath: path.join(__dirname, '../__fixtures__/har/test-response.json'),
+        bodyCompression: null,
+      });
+      const exportRequests = [
+        {
+          requestId: req1._id,
+          environmentId: 'n/a',
+        },
+      ];
+      const harExport = await exportHar(exportRequests);
+      expect(harExport).toMatchObject({
+        log: {
+          version: '1.2',
+          creator: {
+            name: 'Insomnia REST Client',
+          },
+          entries: [
+            {
+              startedDateTime: expect.any(String),
+              time: 999,
+              request: {
+                method: 'POST',
+                url: 'https://httpstat.us/200',
+                httpVersion: 'HTTP/1.1',
+                cookies: [],
+                headers: [
+                  {
+                    name: 'Accept',
+                    value: 'application/json',
+                  },
+                  {
+                    name: 'Content-Type',
+                    value: 'application/json',
+                  },
+                ],
+                queryString: [],
+                postData: {
+                  mimeType: 'application/json',
+                  text: '{}',
+                },
+                headersSize: -1,
+                bodySize: -1,
+              },
+              response: {
+                status: 200,
+                statusText: 'OK',
+                httpVersion: 'HTTP/1.1',
+                cookies: [],
+                headers: [
+                  {
+                    name: 'Content-Type',
+                    value: 'application/json',
+                  },
+                ],
+                content: {
+                  size: 15,
+                  mimeType: 'application/json',
+                  text: '{"key":"value"}',
+                },
+                redirectURL: '',
+                headersSize: -1,
+                bodySize: -1,
+              },
+              cache: {},
+              timings: {
+                blocked: -1,
+                dns: -1,
+                connect: -1,
+                send: 0,
+                wait: 999,
+                receive: 0,
+                ssl: -1,
+              },
+              comment: req1.name,
+            },
+          ],
+        },
+      });
+    });
+
+    it('exports multiple requests', async () => {
+      const workspace = await services.workspace.create({
+        _id: 'wrk_1',
+        name: 'Workspace',
+      });
+      const baseReq = await services.request.create({
+        _id: 'req_0',
+        type: models.request.type,
+        name: 'Request',
+        parentId: workspace._id,
+        url: 'http://localhost',
+        method: 'GET',
+        body: {},
+        headers: [
+          {
+            name: 'X-Environment',
+            value: '{{ envvalue }}',
+          },
+        ],
+      });
+      const req1 = await services.request.duplicate(baseReq);
+      req1._id = 'req_1';
+      req1.name = 'Request 1';
+      req1.headers.push({
+        name: 'X-Request',
+        value: '1',
+      });
+      await services.request.create(req1);
+      const req2 = await services.request.duplicate(baseReq);
+      req2._id = 'req_2';
+      req2.name = 'Request 2';
+      req2.headers.push({
+        name: 'X-Request',
+        value: '2',
+      });
+      await services.request.create(req2);
+      const req3 = await services.request.duplicate(baseReq);
+      req3._id = 'req_3';
+      req3.name = 'Request 3';
+      req3.headers.push({
+        name: 'X-Request',
+        value: '3',
+      });
+      await services.request.create(req3);
+      const envBase = await services.environment.getOrCreateForParentId(workspace._id);
+      await services.environment.update(envBase, {
+        data: {
+          envvalue: '',
+        },
+      });
+      const envPublic = await services.environment.create({
+        _id: 'env_1',
+        name: 'Public',
+        parentId: envBase._id,
+        data: {
+          envvalue: 'public',
+        },
+      });
+      const envPrivate = await services.environment.create({
+        _id: 'env_2',
+        name: 'Private',
+        isPrivate: true,
+        parentId: envBase._id,
+        data: {
+          envvalue: 'private',
+        },
+      });
+      await services.response.create({
+        _id: 'res_1',
+        parentId: req1._id,
+        statusCode: 204,
+      });
+      await services.response.create({
+        _id: 'res_2',
+        parentId: req2._id,
+        statusCode: 404,
+      });
+      await services.response.create({
+        _id: 'res_3',
+        parentId: req3._id,
+        statusCode: 500,
+      });
+      const exportRequests = [
+        {
+          requestId: req1._id,
+          environmentId: null,
+        },
+        {
+          requestId: req2._id,
+          environmentId: envPublic._id,
+        },
+        {
+          requestId: req3._id,
+          environmentId: envPrivate._id,
+        },
+      ];
+      const harExport = await exportHar(exportRequests);
+      expect(harExport).toMatchObject({
+        log: {
+          version: '1.2',
+          creator: {
+            name: 'Insomnia REST Client',
+          },
+          entries: [
+            {
+              request: {
+                headers: [
+                  {
+                    name: 'X-Environment',
+                    value: '',
+                  },
+                  {
+                    name: 'X-Request',
+                    value: '1',
+                  },
+                ],
+              },
+              response: {
+                status: 204,
+              },
+              comment: req1.name,
+            },
+            {
+              request: {
+                headers: [
+                  {
+                    name: 'X-Environment',
+                    value: 'public',
+                  },
+                  {
+                    name: 'X-Request',
+                    value: '2',
+                  },
+                ],
+              },
+              response: {
+                status: 404,
+              },
+              comment: req2.name,
+            },
+            {
+              request: {
+                headers: [
+                  {
+                    name: 'X-Environment',
+                    value: 'private',
+                  },
+                  {
+                    name: 'X-Request',
+                    value: '3',
+                  },
+                ],
+              },
+              response: {
+                status: 500,
+              },
+              comment: req3.name,
+            },
+          ],
+        },
+      });
+    });
+  });
+
+  describe('exportHarResponse()', () => {
+    it('exports a default har response for an empty response', async () => {
+      const notFoundResponse = null;
+      // @ts-expect-error -- testing null response handling
+      const harResponse = await exportHarResponse(notFoundResponse);
+      expect(harResponse).toMatchObject({
+        status: 0,
+        statusText: '',
+        httpVersion: 'HTTP/1.1',
+        content: {
+          size: 0,
+          mimeType: '',
+        },
+      });
+    });
+
+    it('exports a valid har response for a non empty response', async () => {
+      const response: Response = {
+        ...models.response.init(),
+        _id: 'res_123',
+        isPrivate: false,
+        name: '',
+        type: models.response.type,
+        parentId: 'req_123',
+        modified: 0,
+        created: 0,
+        statusCode: 200,
+        statusMessage: 'OK',
+        headers: [
+          {
+            name: 'Content-Length',
+            value: '2',
+          },
+          {
+            name: 'Content-Type',
+            value: 'application/json',
+          },
+          {
+            name: 'Set-Cookie',
+            value: 'sessionid=12345; HttpOnly; Path=/',
+          },
+        ],
+        contentType: 'application/json',
+        bodyPath: path.join(__dirname, '../__fixtures__/har/test-response.json'),
+      };
+      cookieBridge.parse.mockResolvedValueOnce({
+        id: '',
+        key: 'sessionid',
+        value: '12345',
+        expires: null,
+        domain: '',
+        path: '/',
+        secure: false,
+        httpOnly: true,
+      });
+      const harResponse = await exportHarResponse(response);
+      expect(harResponse).toMatchObject({
+        status: 200,
+        statusText: 'OK',
+        httpVersion: 'HTTP/1.1',
+        cookies: [
+          {
+            name: 'sessionid',
+            value: '12345',
+            path: '/',
+            httpOnly: true,
+          },
+        ],
+        headers: [
+          {
+            name: 'Content-Length',
+            value: '2',
+          },
+
+          {
+            name: 'Content-Type',
+            value: 'application/json',
+          },
+          {
+            name: 'Set-Cookie',
+            value: 'sessionid=12345; HttpOnly; Path=/',
+          },
+        ],
+        content: {
+          size: 15,
+          mimeType: 'application/json',
+          text: '{"key":"value"}',
+        },
+        redirectURL: '',
+        headersSize: -1,
+        bodySize: -1,
+      });
+    });
+  });
+
+  describe('Generate Code vs explicit export separation', () => {
+    it('exportHarWithRequest with purpose=preview masks confidential env values when setting is ON (default)', async () => {
+      const workspace = await services.workspace.create();
+      const baseEnv = await services.environment.getOrCreateForParentId(workspace._id);
+      await services.environment.update(baseEnv, {
+        data: { token: 'real-secret' },
+        kvPairData: [
+          {
+            id: 'pair_token',
+            name: 'token',
+            value: 'real-secret',
+            type: EnvironmentKvPairDataType.STRING,
+            enabled: true,
+            isConfidential: true,
+          },
+        ],
+      });
+      const request: Request = {
+        ...models.request.init(),
+        _id: 'req_codegen',
+        modified: 1,
+        created: 1,
+        parentId: workspace._id,
+        type: models.request.type,
+        headers: [{ name: 'Authorization', value: 'Bearer {{ _.token }}' }],
+        method: 'GET',
+        url: 'https://api.example.com/',
+      };
+      const { context } = await getRenderedRequestAndContext({ request, environment: baseEnv._id, purpose: 'preview' });
+      expect((context as any).token).toBe(models.environment.vaultEnvironmentMaskValue);
+    });
+
+    it('exportHar (explicit export) uses undefined purpose — confidential env values are masked (same as SECRET, not affected by setting)', async () => {
+      const workspace = await services.workspace.create({ _id: 'wrk_export_sep' });
+      const baseEnv = await services.environment.getOrCreateForParentId(workspace._id);
+      await services.environment.update(baseEnv, {
+        data: { token: 'real-secret' },
+        kvPairData: [
+          {
+            id: 'pair_token',
+            name: 'token',
+            value: 'real-secret',
+            type: EnvironmentKvPairDataType.STRING,
+            enabled: true,
+            isConfidential: true,
+          },
+        ],
+      });
+      const request: Request = {
+        ...models.request.init(),
+        _id: 'req_export_sep',
+        modified: 1,
+        created: 1,
+        parentId: workspace._id,
+        type: models.request.type,
+        method: 'GET',
+        url: 'https://api.example.com/',
+        headers: [],
+      };
+      // explicit export passes no purpose → fail-closed 'mask' → same behaviour as SECRET
+      const { context } = await getRenderedRequestAndContext({ request, environment: baseEnv._id });
+      expect((context as any).token).toBe(models.environment.vaultEnvironmentMaskValue);
+    });
+  });
+
+  describe('exportHarWithRenderedRequest()', () => {
+    const renderedRequest = (overrides: Partial<RenderedRequest>): RenderedRequest => ({
+      ...models.request.init(),
+      _id: 'req_masked',
+      type: models.request.type,
+      parentId: 'wrk_masked',
+      modified: 1,
+      created: 1,
+      isPrivate: false,
+      cookies: [],
+      cookieJar: { ...models.cookieJar.init(), _id: 'jar', type: models.cookieJar.type, parentId: 'wrk_masked', modified: 1, created: 1, isPrivate: false, cookies: [] },
+      suppressUserAgent: false,
+      ...overrides,
+    });
+
+    it('keeps a masked host as the mask and shows a masked Basic Auth header as the mask', async () => {
+      const har = await exportHarWithRenderedRequest(
+        renderedRequest({
+          url: '••••••/users',
+          authentication: { type: 'basic', username: '••••••', password: 'pass' },
+        }),
+      );
+
+      expect(har.url).toBe('••••••/users');
+      expect(har.headers).toContainEqual({ name: 'Authorization', value: 'Basic ••••••' });
+    });
+  });
+
+  describe('exportHarWithRequest()', () => {
+    it('renders does it correctly', async () => {
+      const workspace = await services.workspace.create();
+      const cookies: Cookie[] = [
+        {
+          id: '',
+          secure: false,
+          httpOnly: false,
+          creation: new Date('2016-10-05T04:40:49.505Z'),
+          key: 'foo',
+          value: 'barrrrr',
+          expires: new Date('2096-10-12T04:40:49.000Z'),
+          domain: 'google.com',
+          path: '/',
+          hostOnly: true,
+          lastAccessed: new Date('2096-10-05T04:40:49.505Z'),
+        },
+      ];
+      const cookieJar = await services.cookieJar.getOrCreateForParentId(workspace._id);
+      await services.cookieJar.update(cookieJar, {
+        parentId: workspace._id,
+        cookies,
+      });
+      const request: Request = {
+        ...models.request.init(),
+        _id: 'req_123',
+        modified: 123,
+        created: 123,
+        parentId: workspace._id,
+        type: models.request.type,
+        headers: [
+          {
+            name: 'Content-Type',
+            value: 'application/json',
+          },
+        ],
+        parameters: [
+          {
+            name: 'foo bar',
+            value: 'hello&world',
+          },
+        ],
+        method: 'POST',
+        body: {
+          text: 'foo bar',
+        },
+        url: 'http://google.com',
+        authentication: {
+          type: 'basic',
+          username: 'user',
+          password: 'pass',
+        },
+      };
+      const { request: renderedRequest } = await getRenderedRequestAndContext({ request });
+      cookieBridge.getCookiesForUrl.mockResolvedValue(cookies);
+      const har = await exportHarWithRequest(renderedRequest);
+      expect(har.cookies.length).toBe(1);
+      expect(har).toEqual({
+        bodySize: -1,
+        cookies: [
+          {
+            domain: 'google.com',
+            expires: '2096-10-12T04:40:49.000Z',
+            name: 'foo',
+            path: '/',
+            value: 'barrrrr',
+          },
+        ],
+        headers: [
+          {
+            name: 'Content-Type',
+            value: 'application/json',
+          },
+          {
+            name: 'Authorization',
+            value: 'Basic dXNlcjpwYXNz',
+          },
+        ],
+        headersSize: -1,
+        httpVersion: 'HTTP/1.1',
+        method: 'POST',
+        postData: {
+          mimeType: '',
+          text: 'foo bar',
+        },
+        queryString: [
+          {
+            name: 'foo bar',
+            value: 'hello&world',
+          },
+        ],
+        url: 'http://google.com/',
+      });
+    });
+
+    it('export multipart request with file', async () => {
+      const workspace = await services.workspace.create();
+      const request: Request = {
+        ...models.request.init(),
+        _id: 'req_123',
+        type: models.request.type,
+        modified: 123,
+        created: 123,
+        parentId: workspace._id,
+        headers: [
+          {
+            name: 'Content-Type',
+            value: 'multipart/form-data',
+          },
+        ],
+        parameters: [],
+        method: 'POST',
+        body: {
+          mimeType: 'multipart/form-data',
+          params: [
+            {
+              name: 'a_file',
+              value: '',
+              fileName: '/tmp/my_file',
+              type: 'file',
+            },
+            {
+              name: 'a_simple_field',
+              value: 'a_simple_value',
+            },
+            {
+              name: 'a_second_file',
+              value: '',
+              fileName: '/tmp/my_file_2',
+              type: 'file',
+            },
+          ],
+        },
+        url: 'http://example.com/post',
+        authentication: {},
+      };
+      const { request: renderedRequest } = await getRenderedRequestAndContext({ request });
+      const har = await exportHarWithRequest(renderedRequest);
+      expect(har).toEqual({
+        bodySize: -1,
+        cookies: [],
+        headers: [
+          {
+            name: 'Content-Type',
+            value: 'multipart/form-data',
+          },
+        ],
+        headersSize: -1,
+        httpVersion: 'HTTP/1.1',
+        method: 'POST',
+        postData: {
+          mimeType: 'multipart/form-data',
+          params: [
+            {
+              name: 'a_file',
+              fileName: '/tmp/my_file',
+            },
+            {
+              name: 'a_simple_field',
+              value: 'a_simple_value',
+            },
+            {
+              name: 'a_second_file',
+              fileName: '/tmp/my_file_2',
+            },
+          ],
+        },
+        queryString: [],
+        url: 'http://example.com/post',
+      });
+    });
+  });
+});

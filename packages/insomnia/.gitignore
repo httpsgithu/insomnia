@@ -1,0 +1,8 @@
+dist
+build
+.vite-port
+
+# Generated
+src/*.js
+src/*.js.map
+.react-router/

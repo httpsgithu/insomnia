@@ -1,0 +1,1325 @@
+// @ts-nocheck
+import fs from 'node:fs';
+import nodePath from 'node:path';
+
+import { CurlHttpVersion, CurlNetrc } from '@getinsomnia/node-libcurl';
+import { models, services } from 'insomnia-data';
+import { HttpVersions } from 'insomnia-data/common';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { version } from '../../../package.json';
+import { CONTENT_TYPE_FILE, CONTENT_TYPE_FORM_DATA, CONTENT_TYPE_FORM_URLENCODED } from '../../common/constants';
+import { filterHeaders } from '../../common/misc';
+import { getRenderedRequestAndContext } from '../../common/render';
+import { getAuthHeader } from '../../main/network/get-auth-header';
+import { _parseHeaders, curlRequest, getHttpVersion } from '../../main/network/libcurl-promise';
+import { _getAwsAuthHeaders } from '../../network/parse-header-strings';
+import { DEFAULT_BOUNDARY } from '../multipart-constants';
+import * as networkUtils from '../network';
+import { getAuthQueryParams, getSetCookiesFromResponseHeaders } from '../network';
+
+const getRenderedRequest = async (args: Parameters<typeof getRenderedRequestAndContext>[0]) =>
+  (await getRenderedRequestAndContext(args)).request;
+describe('getAuthQueryParams', () => {
+  it('Creates a query param with key as parameter name and value as parameter value, when addTo is "queryParams"', async () => {
+    const authentication = {
+      type: 'apikey',
+      key: 'x-api-key',
+      value: 'test',
+      addTo: 'queryParams',
+    };
+
+    const header = getAuthQueryParams(authentication);
+    expect(header).toEqual({
+      name: 'x-api-key',
+      value: 'test',
+    });
+  });
+});
+describe('sendCurlAndWriteTimeline()', () => {
+  it('sends a generic request', async () => {
+    const workspace = await services.workspace.create();
+    const settings = await services.settings.getOrCreate();
+    const cookies = [
+      {
+        creation: new Date('2016-10-05T04:40:49.505Z'),
+        key: 'foo',
+        value: 'barrrrr',
+        expires: new Date('2096-10-12T04:40:49.000Z'),
+        domain: 'notlocalhost',
+        path: '/',
+        hostOnly: true,
+        lastAccessed: new Date('2096-10-05T04:40:49.505Z'),
+      },
+      {
+        creation: new Date('2016-10-05T04:40:49.505Z'),
+        key: 'foo',
+        value: 'bar',
+        expires: new Date('2096-10-12T04:40:49.000Z'),
+        domain: 'localhost',
+        path: '/',
+        hostOnly: true,
+        lastAccessed: new Date('2096-10-05T04:40:49.505Z'),
+      },
+    ];
+    const cookieJar = await services.cookieJar.getOrCreateForParentId(workspace._id);
+    await services.cookieJar.update(cookieJar, {
+      parentId: workspace._id,
+      cookies,
+    });
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_123',
+      parentId: workspace._id,
+      headers: [
+        {
+          name: 'Content-Type',
+          value: 'application/json',
+        },
+        {
+          name: 'Empty',
+          value: '',
+        },
+      ],
+      parameters: [
+        {
+          name: 'foo bar',
+          value: 'hello&world',
+        },
+      ],
+      method: 'POST',
+      body: {
+        mimeType: CONTENT_TYPE_FORM_URLENCODED,
+        params: [
+          {
+            name: 'foo',
+            value: 'bar',
+          },
+        ],
+      },
+      url: 'http://localhost',
+      authentication: {
+        type: 'basic',
+        username: 'user',
+        password: 'pass',
+      },
+    });
+    const renderedRequest = await getRenderedRequest({ request });
+    const response = await networkUtils.sendCurlAndWriteTimeline(
+      renderedRequest,
+      [],
+      undefined,
+      settings,
+      '/tmp/res_id',
+      'res_id',
+    );
+    const bodyBuffer = await services.helpers.getResponseBodyBuffer(response);
+    const body = JSON.parse(String(bodyBuffer));
+    expect(body).toEqual({
+      meta: {},
+      features: {
+        Raw: true,
+      },
+      options: {
+        COOKIELIST: [
+          'notlocalhost\tFALSE\t/\tFALSE\t4000855249\tfoo\tbarrrrr',
+          'localhost\tFALSE\t/\tFALSE\t4000855249\tfoo\tbar',
+        ],
+        ACCEPT_ENCODING: '',
+        COOKIEFILE: '',
+        FOLLOWLOCATION: true,
+        HTTPHEADER: [
+          'Content-Type: application/json',
+          'Empty;',
+          'Expect:',
+          'Transfer-Encoding:',
+          'Authorization: Basic dXNlcjpwYXNz',
+          'Accept: */*',
+          'Accept-Encoding:',
+        ],
+        MAXREDIRS: 10,
+        NOPROGRESS: true,
+        POSTFIELDS: 'foo=bar',
+        POST: 1,
+        PROXY: '',
+        TIMEOUT_MS: 30_000,
+        URL: 'http://localhost/?foo%20bar=hello%26world',
+        USERAGENT: `insomnia/${version}`,
+        VERBOSE: true,
+        SSL_OPTIONS: 'NativeCa',
+      },
+    });
+  });
+
+  it('sends a urlencoded', async () => {
+    const workspace = await services.workspace.create();
+    const settings = await services.settings.getOrCreate();
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_123',
+      parentId: workspace._id,
+      headers: [
+        {
+          name: 'Content-Type',
+          value: CONTENT_TYPE_FORM_URLENCODED,
+        },
+      ],
+      method: 'POST',
+      body: {
+        mimeType: CONTENT_TYPE_FORM_URLENCODED,
+        params: [
+          {
+            name: 'foo',
+            value: 'bar',
+          },
+          {
+            name: 'bar',
+            value: '',
+          },
+          {
+            name: '',
+            value: 'value',
+          },
+        ],
+      },
+      url: 'http://localhost',
+    });
+    const renderedRequest = await getRenderedRequest({ request });
+    const response = await networkUtils.sendCurlAndWriteTimeline(
+      renderedRequest,
+      [],
+      undefined,
+      settings,
+      '/tmp/res_id',
+      'res_id',
+    );
+    const bodyBuffer = await services.helpers.getResponseBodyBuffer(response);
+    const body = JSON.parse(String(bodyBuffer));
+    expect(body).toEqual({
+      meta: {},
+      features: {
+        Raw: true,
+      },
+      options: {
+        POST: 1,
+        ACCEPT_ENCODING: '',
+        COOKIEFILE: '',
+        FOLLOWLOCATION: true,
+        HTTPHEADER: [
+          'Content-Type: application/x-www-form-urlencoded',
+          'Expect:',
+          'Transfer-Encoding:',
+          'Accept: */*',
+          'Accept-Encoding:',
+        ],
+        MAXREDIRS: 10,
+        NOPROGRESS: true,
+        POSTFIELDS: 'foo=bar&bar=&=value',
+        PROXY: '',
+        TIMEOUT_MS: 30_000,
+        URL: 'http://localhost/',
+        USERAGENT: `insomnia/${version}`,
+        VERBOSE: true,
+        SSL_OPTIONS: 'NativeCa',
+      },
+    });
+  });
+
+  it('skips sending and storing cookies with setting', async () => {
+    const workspace = await services.workspace.create();
+    const settings = await services.settings.getOrCreate();
+    const cookies = [
+      {
+        creation: new Date('2016-10-05T04:40:49.505Z'),
+        key: 'foo',
+        value: 'barrrrr',
+        expires: new Date('2096-10-12T04:40:49.000Z'),
+        domain: 'notlocalhost',
+        path: '/',
+        hostOnly: true,
+        lastAccessed: new Date('2096-10-05T04:40:49.505Z'),
+      },
+      {
+        creation: new Date('2016-10-05T04:40:49.505Z'),
+        key: 'foo',
+        value: 'barrrrr',
+        expires: new Date('2096-10-12T04:40:49.000Z'),
+        domain: 'localhost',
+        path: '/',
+        hostOnly: true,
+        lastAccessed: new Date('2096-10-05T04:40:49.505Z'),
+      },
+    ];
+    await services.cookieJar.create({
+      parentId: workspace._id,
+      cookies,
+    });
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_123',
+      parentId: workspace._id,
+      headers: [
+        {
+          name: 'Content-Type',
+          value: 'application/json',
+        },
+      ],
+      parameters: [
+        {
+          name: 'foo bar',
+          value: 'hello&world',
+        },
+      ],
+      method: 'GET',
+      body: {
+        mimeType: CONTENT_TYPE_FORM_URLENCODED,
+        params: [
+          {
+            name: 'foo',
+            value: 'bar',
+          },
+        ],
+      },
+      url: 'http://localhost',
+      authentication: {
+        type: 'basic',
+        username: 'user',
+        password: 'pass',
+      },
+      settingStoreCookies: false,
+      settingSendCookies: false,
+    });
+    const renderedRequest = await getRenderedRequest({ request });
+    const response = await networkUtils.sendCurlAndWriteTimeline(
+      renderedRequest,
+      [],
+      undefined,
+      settings,
+      '/tmp/res_id',
+      'res_id',
+    );
+    const bodyBuffer = await services.helpers.getResponseBodyBuffer(response);
+    const body = JSON.parse(String(bodyBuffer));
+    expect(body).toEqual({
+      meta: {},
+      features: {
+        Raw: true,
+      },
+      options: {
+        CUSTOMREQUEST: 'GET',
+        ACCEPT_ENCODING: '',
+        FOLLOWLOCATION: true,
+        HTTPHEADER: [
+          'Content-Type: application/json',
+          'Expect:',
+          'Transfer-Encoding:',
+          'Authorization: Basic dXNlcjpwYXNz',
+          'Accept: */*',
+          'Accept-Encoding:',
+        ],
+        MAXREDIRS: 10,
+        NOPROGRESS: true,
+        POSTFIELDS: 'foo=bar',
+        PROXY: '',
+        TIMEOUT_MS: 30_000,
+        URL: 'http://localhost/?foo%20bar=hello%26world',
+        USERAGENT: `insomnia/${version}`,
+        VERBOSE: true,
+        SSL_OPTIONS: 'NativeCa',
+      },
+    });
+  });
+
+  it('sends a file', async () => {
+    const workspace = await services.workspace.create();
+    let settings = await services.settings.getOrCreate();
+    settings = await services.settings.update(settings, { dataFolders: [nodePath.resolve(__dirname)] });
+    await services.cookieJar.create({
+      parentId: workspace._id,
+    });
+    const fileName = nodePath.resolve(nodePath.join(__dirname, './testfile.txt'));
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_123',
+      parentId: workspace._id,
+      headers: [
+        {
+          name: 'Content-Type',
+          value: 'application/octet-stream',
+        },
+      ],
+      url: 'http://localhost',
+      method: 'POST',
+      body: {
+        mimeType: CONTENT_TYPE_FILE,
+        fileName,
+      },
+    });
+    const renderedRequest = await getRenderedRequest({ request });
+    const response = await networkUtils.sendCurlAndWriteTimeline(
+      renderedRequest,
+      [],
+      undefined,
+      settings,
+      '/tmp/res_id',
+      'res_id',
+    );
+    const bodyBuffer = await services.helpers.getResponseBodyBuffer(response);
+    const body = JSON.parse(String(bodyBuffer));
+    expect(body).toEqual({
+      meta: {},
+      features: {
+        Raw: true,
+      },
+      options: {
+        POST: 1,
+        ACCEPT_ENCODING: '',
+        CUSTOMREQUEST: 'POST',
+        COOKIEFILE: '',
+        FOLLOWLOCATION: true,
+        HTTPHEADER: [
+          'Content-Type: application/octet-stream',
+          'Expect:',
+          'Transfer-Encoding:',
+          'Accept: */*',
+          'Accept-Encoding:',
+        ],
+        MAXREDIRS: 10,
+        NOPROGRESS: true,
+        INFILESIZE_LARGE: 26,
+        PROXY: '',
+        READDATA: fs.readFileSync(fileName, 'utf8'),
+        TIMEOUT_MS: 30_000,
+        UPLOAD: 1,
+        URL: 'http://localhost/',
+        USERAGENT: `insomnia/${version}`,
+        VERBOSE: true,
+        SSL_OPTIONS: 'NativeCa',
+      },
+    });
+  });
+
+  it('sends multipart form data', async () => {
+    const workspace = await services.workspace.create();
+    let settings = await services.settings.getOrCreate();
+    settings = await services.settings.update(settings, { dataFolders: [nodePath.resolve(__dirname)] });
+    await services.cookieJar.create({
+      parentId: workspace._id,
+    });
+    const fileName = nodePath.resolve(nodePath.join(__dirname, './testfile.txt'));
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_123',
+      parentId: workspace._id,
+      headers: [
+        {
+          name: 'Content-Type',
+          value: 'multipart/form-data',
+        },
+      ],
+      url: 'http://localhost',
+      method: 'POST',
+      body: {
+        mimeType: CONTENT_TYPE_FORM_DATA,
+        params: [
+          // Should ignore value and send the file since type is set to file
+          {
+            name: 'foo',
+            fileName: fileName,
+            value: 'bar',
+            type: 'file',
+          }, // Some extra params
+          {
+            name: 'a',
+            value: 'AA',
+          },
+          {
+            name: 'baz',
+            value: 'qux',
+            disabled: true,
+          },
+        ],
+      },
+    });
+    const renderedRequest = await getRenderedRequest({ request });
+    const response = await networkUtils.sendCurlAndWriteTimeline(
+      renderedRequest,
+      [],
+      undefined,
+      settings,
+      '/tmp/res_id',
+      'res_id',
+    );
+    const bodyBuffer = await services.helpers.getResponseBodyBuffer(response);
+    const body = JSON.parse(String(bodyBuffer));
+    expect(body).toEqual({
+      meta: {},
+      features: {
+        Raw: true,
+      },
+      options: {
+        POST: 1,
+        ACCEPT_ENCODING: '',
+        COOKIEFILE: '',
+        FOLLOWLOCATION: true,
+        CUSTOMREQUEST: 'POST',
+        HTTPHEADER: [
+          'Content-Type: multipart/form-data; boundary=X-INSOMNIA-BOUNDARY',
+          'Expect:',
+          'Transfer-Encoding:',
+          'Accept: */*',
+          'Accept-Encoding:',
+        ],
+        INFILESIZE_LARGE: 244,
+        MAXREDIRS: 10,
+        NOPROGRESS: true,
+        READDATA: [
+          `--${DEFAULT_BOUNDARY}`,
+          'Content-Disposition: form-data; name="foo"; filename="testfile.txt"',
+          'Content-Type: text/plain',
+          '',
+          fs.readFileSync(fileName),
+          `--${DEFAULT_BOUNDARY}`,
+          'Content-Disposition: form-data; name="a"',
+          '',
+          'AA',
+          `--${DEFAULT_BOUNDARY}--`,
+          '',
+        ].join('\r\n'),
+        PROXY: '',
+        TIMEOUT_MS: 30_000,
+        URL: 'http://localhost/',
+        UPLOAD: 1,
+        USERAGENT: `insomnia/${version}`,
+        VERBOSE: true,
+        SSL_OPTIONS: 'NativeCa',
+      },
+    });
+  });
+
+  it('uses unix socket', async () => {
+    const workspace = await services.workspace.create();
+    const settings = await services.settings.getOrCreate();
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_123',
+      parentId: workspace._id,
+      url: 'http://unix:/my/socket:/my/path',
+      method: 'GET',
+    });
+    const renderedRequest = await getRenderedRequest({ request });
+    const response = await networkUtils.sendCurlAndWriteTimeline(
+      renderedRequest,
+      [],
+      undefined,
+      settings,
+      '/tmp/res_id',
+      'res_id',
+    );
+    const bodyBuffer = await services.helpers.getResponseBodyBuffer(response);
+    const body = JSON.parse(String(bodyBuffer));
+    expect(body).toEqual({
+      meta: {},
+      features: {
+        Raw: true,
+      },
+      options: {
+        CUSTOMREQUEST: 'GET',
+        ACCEPT_ENCODING: '',
+        COOKIEFILE: '',
+        FOLLOWLOCATION: true,
+        HTTPHEADER: ['Accept: */*', 'Accept-Encoding:', 'content-type:'],
+        MAXREDIRS: 10,
+        NOPROGRESS: true,
+        PROXY: '',
+        TIMEOUT_MS: 30_000,
+        URL: 'http://my/path',
+        UNIX_SOCKET_PATH: '/my/socket',
+        USERAGENT: `insomnia/${version}`,
+        VERBOSE: true,
+        SSL_OPTIONS: 'NativeCa',
+      },
+    });
+  });
+
+  it('uses works with HEAD', async () => {
+    const workspace = await services.workspace.create();
+    const settings = await services.settings.getOrCreate();
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_123',
+      parentId: workspace._id,
+      url: 'http://localhost:3000/foo/bar',
+      method: 'HEAD',
+    });
+    const renderedRequest = await getRenderedRequest({ request });
+    const response = await networkUtils.sendCurlAndWriteTimeline(
+      renderedRequest,
+      [],
+      undefined,
+      settings,
+      '/tmp/res_id',
+      'res_id',
+    );
+    const bodyBuffer = await services.helpers.getResponseBodyBuffer(response);
+    const body = JSON.parse(String(bodyBuffer));
+    expect(body).toEqual({
+      meta: {},
+      features: {
+        Raw: true,
+      },
+      options: {
+        NOBODY: 1,
+        ACCEPT_ENCODING: '',
+        COOKIEFILE: '',
+        FOLLOWLOCATION: true,
+        HTTPHEADER: ['Accept: */*', 'Accept-Encoding:', 'content-type:'],
+        MAXREDIRS: 10,
+        NOPROGRESS: true,
+        PROXY: '',
+        TIMEOUT_MS: 30_000,
+        URL: 'http://localhost:3000/foo/bar',
+        USERAGENT: `insomnia/${version}`,
+        VERBOSE: true,
+        SSL_OPTIONS: 'NativeCa',
+      },
+    });
+  });
+
+  it('uses works with "unix" host', async () => {
+    const workspace = await services.workspace.create();
+    const settings = await services.settings.getOrCreate();
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_123',
+      parentId: workspace._id,
+      url: 'http://unix:3000/my/path',
+      method: 'GET',
+    });
+    const renderedRequest = await getRenderedRequest({ request });
+    const response = await networkUtils.sendCurlAndWriteTimeline(
+      renderedRequest,
+      [],
+      undefined,
+      settings,
+      '/tmp/res_id',
+      'res_id',
+    );
+    const bodyBuffer = await services.helpers.getResponseBodyBuffer(response);
+    const body = JSON.parse(String(bodyBuffer));
+    expect(body).toEqual({
+      meta: {},
+      features: {
+        Raw: true,
+      },
+      options: {
+        CUSTOMREQUEST: 'GET',
+        ACCEPT_ENCODING: '',
+        COOKIEFILE: '',
+        FOLLOWLOCATION: true,
+        HTTPHEADER: ['Accept: */*', 'Accept-Encoding:', 'content-type:'],
+        MAXREDIRS: 10,
+        NOPROGRESS: true,
+        PROXY: '',
+        TIMEOUT_MS: 30_000,
+        URL: 'http://unix:3000/my/path',
+        USERAGENT: `insomnia/${version}`,
+        VERBOSE: true,
+        SSL_OPTIONS: 'NativeCa',
+      },
+    });
+  });
+
+  it('uses netrc', async () => {
+    const workspace = await services.workspace.create();
+    const settings = await services.settings.getOrCreate();
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_123',
+      parentId: workspace._id,
+      authentication: {
+        type: 'netrc',
+      },
+    });
+    const renderedRequest = await getRenderedRequest({ request });
+    const response = await networkUtils.sendCurlAndWriteTimeline(
+      renderedRequest,
+      [],
+      undefined,
+      settings,
+      '/tmp/res_id',
+      'res_id',
+    );
+    const bodyBuffer = await services.helpers.getResponseBodyBuffer(response);
+    const body = JSON.parse(String(bodyBuffer));
+    expect(body).toEqual({
+      meta: {},
+      features: {
+        Raw: true,
+      },
+      options: {
+        CUSTOMREQUEST: 'GET',
+        ACCEPT_ENCODING: '',
+        COOKIEFILE: '',
+        FOLLOWLOCATION: true,
+        HTTPHEADER: ['Accept: */*', 'Accept-Encoding:', 'content-type:'],
+        MAXREDIRS: 10,
+        NOPROGRESS: true,
+        PROXY: '',
+        TIMEOUT_MS: 30_000,
+        NETRC: CurlNetrc.Required,
+        URL: '',
+        USERAGENT: `insomnia/${version}`,
+        VERBOSE: true,
+        SSL_OPTIONS: 'NativeCa',
+      },
+    });
+  });
+
+  it('disables ssl verification when configured to do so', async () => {
+    if (process.platform === 'darwin') {
+      // skipped this test, due to SSL_VERIFYHOST being disabled for MacOS on libcurl-promise.ts
+      return;
+    }
+    const workspace = await services.workspace.create();
+    const settings = await services.settings.getOrCreate();
+    const cookies = [
+      {
+        creation: new Date('2016-10-05T04:40:49.505Z'),
+        key: 'foo',
+        value: 'barrrrr',
+        expires: new Date('2096-10-12T04:40:49.000Z'),
+        domain: 'notlocalhost',
+        path: '/',
+        hostOnly: true,
+        lastAccessed: new Date('2096-10-05T04:40:49.505Z'),
+      },
+      {
+        creation: new Date('2016-10-05T04:40:49.505Z'),
+        key: 'foo',
+        value: 'bar',
+        expires: new Date('2096-10-12T04:40:49.000Z'),
+        domain: 'localhost',
+        path: '/',
+        hostOnly: true,
+        lastAccessed: new Date('2096-10-05T04:40:49.505Z'),
+      },
+    ];
+    const cookieJar = await services.cookieJar.getOrCreateForParentId(workspace._id);
+    await services.cookieJar.update(cookieJar, {
+      parentId: workspace._id,
+      cookies,
+    });
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_123',
+      parentId: workspace._id,
+      headers: [
+        {
+          name: 'Content-Type',
+          value: 'application/json',
+        },
+        {
+          name: 'Empty',
+          value: '',
+        },
+      ],
+      parameters: [
+        {
+          name: 'foo bar',
+          value: 'hello&world',
+        },
+      ],
+      method: 'POST',
+      body: {
+        mimeType: CONTENT_TYPE_FORM_URLENCODED,
+        params: [
+          {
+            name: 'foo',
+            value: 'bar',
+          },
+        ],
+      },
+      url: 'http://localhost',
+      authentication: {
+        type: 'basic',
+        username: 'user',
+        password: 'pass',
+      },
+    });
+    const renderedRequest = await getRenderedRequest({ request });
+    const response = await networkUtils.sendCurlAndWriteTimeline(
+      renderedRequest,
+      [],
+      undefined,
+      { ...settings, validateSSL: false },
+      '/tmp/res_id',
+      'res_id',
+    );
+    const bodyBuffer = await services.helpers.getResponseBodyBuffer(response);
+    const body = JSON.parse(String(bodyBuffer));
+    expect(body).toEqual({
+      meta: {},
+      features: {
+        Raw: true,
+      },
+      options: {
+        COOKIELIST: [
+          'notlocalhost\tFALSE\t/\tFALSE\t4000855249\tfoo\tbarrrrr',
+          'localhost\tFALSE\t/\tFALSE\t4000855249\tfoo\tbar',
+        ],
+        ACCEPT_ENCODING: '',
+        COOKIEFILE: '',
+        FOLLOWLOCATION: true,
+        HTTPHEADER: [
+          'Content-Type: application/json',
+          'Empty;',
+          'Expect:',
+          'Transfer-Encoding:',
+          'Authorization: Basic dXNlcjpwYXNz',
+          'Accept: */*',
+          'Accept-Encoding:',
+        ],
+        MAXREDIRS: 10,
+        NOPROGRESS: true,
+        POSTFIELDS: 'foo=bar',
+        POST: 1,
+        PROXY: '',
+        SSL_VERIFYHOST: 0, // should disable SSL
+        SSL_VERIFYPEER: 0, // should disable SSL
+        TIMEOUT_MS: 30_000,
+        URL: 'http://localhost/?foo%20bar=hello%26world',
+        USERAGENT: `insomnia/${version}`,
+        VERBOSE: true,
+        SSL_OPTIONS: 'NativeCa',
+      },
+    });
+  });
+
+  it('sets HTTP version', async () => {
+    const workspace = await services.workspace.create();
+    const settings = await services.settings.getOrCreate();
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_123',
+      parentId: workspace._id,
+    });
+    const renderedRequest = await getRenderedRequest({ request });
+    const responseV1 = await networkUtils.sendCurlAndWriteTimeline(
+      renderedRequest,
+      [],
+      undefined,
+      {
+        ...settings,
+        preferredHttpVersion: HttpVersions.V1_0,
+      },
+      '/tmp/res_id',
+      'res_id',
+    );
+    expect(JSON.parse(String(await services.helpers.getResponseBodyBuffer(responseV1))).options.HTTP_VERSION).toBe(
+      'V1_0',
+    );
+    expect(getHttpVersion(HttpVersions.V1_0).curlHttpVersion).toBe(CurlHttpVersion.V1_0);
+    expect(getHttpVersion(HttpVersions.V1_1).curlHttpVersion).toBe(CurlHttpVersion.V1_1);
+    expect(getHttpVersion(HttpVersions.V2PriorKnowledge).curlHttpVersion).toBe(CurlHttpVersion.V2PriorKnowledge);
+    expect(getHttpVersion(HttpVersions.V2_0).curlHttpVersion).toBe(CurlHttpVersion.V2_0);
+    expect(getHttpVersion(HttpVersions.v3).curlHttpVersion).toBe(CurlHttpVersion.v3);
+    expect(getHttpVersion(HttpVersions.default).curlHttpVersion).toBe(undefined);
+    expect(getHttpVersion('blah').curlHttpVersion).toBe(undefined);
+  });
+});
+
+describe('_getAwsAuthHeaders', () => {
+  it('should generate expected headers', () => {
+    const authentication = {
+      type: 'iam',
+      accessKeyId: 'AKIA99999999',
+      secretAccessKey: 'SAK9999999999999',
+      sessionToken: 'ST99999999999999',
+      region: 'us-west-2',
+      service: 'ec2',
+    };
+
+    const headers = _getAwsAuthHeaders({
+      authentication,
+      url: 'https://ec2.us-west-2.amazonaws.com/path?query=q1',
+      method: 'POST',
+      contentTypeHeader: 'application/json',
+      body: '{}',
+    });
+
+    expect(filterHeaders(headers, 'x-amz-date')[0].value).toMatch(/^\d{8}T\d{6}Z$/);
+    expect(filterHeaders(headers, 'host')[0].value).toEqual('ec2.us-west-2.amazonaws.com');
+    expect(filterHeaders(headers, 'authorization')[0].value).toMatch(
+      /^AWS4-HMAC-SHA256 Credential=AKIA99999999\/\d{8}\/us-west-2\/ec2\/aws4_request, SignedHeaders=content-length;content-type;host;x-amz-date;x-amz-security-token, Signature=[a-z0-9]*$/,
+    );
+    expect(filterHeaders(headers, 'content-type')).toEqual([]);
+  });
+
+  it('should handle sparse request', () => {
+    const authentication = {
+      type: 'iam',
+      accessKeyId: 'AKIA99999999',
+      secretAccessKey: 'SAK9999999999999',
+      sessionToken: 'ST99999999999999',
+      region: 'us-west-2',
+      service: 'ec2',
+    };
+
+    const headers = _getAwsAuthHeaders({
+      authentication,
+      url: 'https://example.com',
+      method: 'GET',
+    });
+    expect(filterHeaders(headers, 'x-amz-date')[0].value).toMatch(/^\d{8}T\d{6}Z$/);
+    expect(filterHeaders(headers, 'host')[0].value).toEqual('example.com');
+    expect(filterHeaders(headers, 'authorization')[0].value).toMatch(
+      /^AWS4-HMAC-SHA256 Credential=AKIA99999999\/\d{8}\/us-west-2\/ec2\/aws4_request, SignedHeaders=host;x-amz-date;x-amz-security-token, Signature=[a-z0-9]*$/,
+    );
+    expect(filterHeaders(headers, 'content-type')).toEqual([]);
+  });
+});
+
+describe('_parseHeaders', () => {
+  const basicHeaders = [
+    'HTTP/1.1 301 Moved Permanently',
+    'X-Powered-By: Express',
+    'location: http://localhost:3000/',
+    'Content-Type: text/plain; charset=utf-8',
+    'Content-Length: 17',
+    'ETag: W/"11-WKzg6oYof0o8Mliwrz5pkw"',
+    'Duplicate: foo',
+    'Duplicate: bar',
+    'Date: Mon, 13 Nov 2017 22:06:28 GMT',
+    'Foo', // Invalid header
+    '',
+  ];
+  const minimalHeaders = ['HTTP/1.1 301', ''];
+
+  it('Parses single response headers', () => {
+    expect(_parseHeaders(Buffer.from(basicHeaders.join('\n')))).toEqual([
+      {
+        code: 301,
+        version: 'HTTP/1.1',
+        reason: 'Moved Permanently',
+        headers: [
+          {
+            name: 'X-Powered-By',
+            value: 'Express',
+          },
+          {
+            name: 'location',
+            value: 'http://localhost:3000/',
+          },
+          {
+            name: 'Content-Type',
+            value: 'text/plain; charset=utf-8',
+          },
+          {
+            name: 'Content-Length',
+            value: '17',
+          },
+          {
+            name: 'ETag',
+            value: 'W/"11-WKzg6oYof0o8Mliwrz5pkw"',
+          },
+          {
+            name: 'Duplicate',
+            value: 'foo',
+          },
+          {
+            name: 'Duplicate',
+            value: 'bar',
+          },
+          {
+            name: 'Date',
+            value: 'Mon, 13 Nov 2017 22:06:28 GMT',
+          },
+          {
+            name: 'Foo',
+            value: '',
+          },
+        ],
+      },
+    ]);
+  });
+
+  it('Parses Windows newlines', () => {
+    expect(_parseHeaders(Buffer.from(basicHeaders.join('\r\n')))).toEqual([
+      {
+        code: 301,
+        version: 'HTTP/1.1',
+        reason: 'Moved Permanently',
+        headers: [
+          {
+            name: 'X-Powered-By',
+            value: 'Express',
+          },
+          {
+            name: 'location',
+            value: 'http://localhost:3000/',
+          },
+          {
+            name: 'Content-Type',
+            value: 'text/plain; charset=utf-8',
+          },
+          {
+            name: 'Content-Length',
+            value: '17',
+          },
+          {
+            name: 'ETag',
+            value: 'W/"11-WKzg6oYof0o8Mliwrz5pkw"',
+          },
+          {
+            name: 'Duplicate',
+            value: 'foo',
+          },
+          {
+            name: 'Duplicate',
+            value: 'bar',
+          },
+          {
+            name: 'Date',
+            value: 'Mon, 13 Nov 2017 22:06:28 GMT',
+          },
+          {
+            name: 'Foo',
+            value: '',
+          },
+        ],
+      },
+    ]);
+  });
+
+  it('Parses multiple responses', () => {
+    const blobs = basicHeaders.join('\r\n') + '\n' + minimalHeaders.join('\n');
+    expect(_parseHeaders(Buffer.from(blobs))).toEqual([
+      {
+        code: 301,
+        version: 'HTTP/1.1',
+        reason: 'Moved Permanently',
+        headers: [
+          {
+            name: 'X-Powered-By',
+            value: 'Express',
+          },
+          {
+            name: 'location',
+            value: 'http://localhost:3000/',
+          },
+          {
+            name: 'Content-Type',
+            value: 'text/plain; charset=utf-8',
+          },
+          {
+            name: 'Content-Length',
+            value: '17',
+          },
+          {
+            name: 'ETag',
+            value: 'W/"11-WKzg6oYof0o8Mliwrz5pkw"',
+          },
+          {
+            name: 'Duplicate',
+            value: 'foo',
+          },
+          {
+            name: 'Duplicate',
+            value: 'bar',
+          },
+          {
+            name: 'Date',
+            value: 'Mon, 13 Nov 2017 22:06:28 GMT',
+          },
+          {
+            name: 'Foo',
+            value: '',
+          },
+        ],
+      },
+      {
+        code: 301,
+        headers: [],
+        reason: '',
+        version: 'HTTP/1.1',
+      },
+    ]);
+  });
+});
+
+describe('getSetCookiesFromResponseHeaders', () => {
+  it('defaults to empty array', () => {
+    const headers = [];
+    expect(getSetCookiesFromResponseHeaders(headers)).toEqual([]);
+  });
+  it('gets set-cookies', () => {
+    const headers = [{ name: 'Set-Cookie', value: 'monster' }];
+    expect(getSetCookiesFromResponseHeaders(headers)).toEqual(['monster']);
+  });
+  it('gets two case-insensitive set-cookies', () => {
+    const headers = [
+      { name: 'Set-Cookie', value: 'monster' },
+      { name: 'set-cookie', value: 'mash' },
+    ];
+    expect(getSetCookiesFromResponseHeaders(headers)).toEqual(['monster', 'mash']);
+  });
+  it('sanitize special characters, remove interpolation symbols', () => {
+    const headers = [
+      { name: 'Set-Cookie', value: 'sessionid=+_)(*&^%$#@!; HttpOnly; Path=/' },
+      { name: 'set-cookie', value: '{% magic %}={{_.env}}; HttpOnly; Path=/' },
+    ];
+    expect(getSetCookiesFromResponseHeaders(headers)).toEqual([
+      'sessionid=+_)(*&^%$#@!; HttpOnly; Path=/',
+      ' magic =_.env; HttpOnly; Path=/',
+    ]);
+  });
+});
+describe('getCurrentUrl for tough-cookie', () => {
+  it('defaults to finalUrl', () => {
+    const headerResults = [];
+    const finalUrl = 'http://mergemyshit.dev';
+    expect(networkUtils.getCurrentUrl({ headerResults, finalUrl })).toEqual(finalUrl);
+  });
+  it('append location to finalUrl', () => {
+    const headerResults = [{ headers: [{ name: 'Location', value: '/cookies' }] }];
+    const finalUrl = 'http://mergemyshit.dev';
+    expect(networkUtils.getCurrentUrl({ headerResults, finalUrl })).toEqual(finalUrl + '/cookies');
+  });
+  it('appends only last location to finalUrl', () => {
+    const headerResults = [
+      { headers: [{ name: 'Location', value: '/cookies' }] },
+      { headers: [{ name: 'location', value: '/biscuit' }] },
+    ];
+    const finalUrl = 'http://mergemyshit.dev';
+    expect(networkUtils.getCurrentUrl({ headerResults, finalUrl })).toEqual(finalUrl + '/biscuit');
+  });
+});
+
+describe('getOrInheritAuthentication', () => {
+  it('should prefer the closest parent folder auth over higher-level folder auth', () => {
+    const request = { authentication: {} };
+    const requestGroups = [
+      { authentication: { type: 'basic', username: 'closest', password: 'closest-pass' } },
+      { authentication: { type: 'basic', username: 'root', password: 'root-pass' } },
+    ];
+
+    expect(networkUtils.getOrInheritAuthentication({ request, requestGroups })).toEqual({
+      type: 'basic',
+      username: 'closest',
+      password: 'closest-pass',
+    });
+  });
+
+  it("should stop inheritance when the closest parent folder auth is { type: 'none' }", () => {
+    const request = { authentication: {} };
+    const requestGroups = [
+      { authentication: { type: 'none' } },
+      { authentication: { type: 'basic', username: 'root', password: 'root-pass' } },
+    ];
+
+    expect(networkUtils.getOrInheritAuthentication({ request, requestGroups })).toEqual({ type: 'none' });
+  });
+});
+
+describe('getOrInheritHeaders', () => {
+  it('should combine headers', () => {
+    const requestGroups = [{ headers: [{ name: 'foo', value: 'bar' }] }, { headers: [{ name: 'baz', value: 'qux' }] }];
+    const request = {
+      headers: [
+        { name: 'foo', value: 'bar' },
+        { name: 'baz', value: 'qux' },
+      ],
+    };
+    expect(networkUtils.getOrInheritHeaders({ request, requestGroups })).toEqual([
+      { name: 'baz', value: 'qux, qux' },
+      { name: 'foo', value: 'bar, bar' },
+    ]);
+  });
+  it('should use last header casing', () => {
+    const requestGroups = [{ headers: [{ name: 'x-foo', value: 'bar' }] }];
+    const request = { headers: [{ name: 'X-Foo', value: 'baz' }] };
+    expect(networkUtils.getOrInheritHeaders({ request, requestGroups })).toEqual([
+      { name: 'X-Foo', value: 'bar, baz' },
+    ]);
+  });
+  it('should not combine special headers', () => {
+    const requestGroups = [
+      {
+        headers: [
+          { name: 'content-type', value: 'application/json' },
+          { name: 'Connection', value: 'close' },
+        ],
+      },
+    ];
+    const request = {
+      headers: [
+        { name: 'Content-Type', value: 'text/plain' },
+        { name: 'connection', value: 'keep-alive' },
+      ],
+    };
+    expect(networkUtils.getOrInheritHeaders({ request, requestGroups })).toEqual([
+      { name: 'connection', value: 'keep-alive' },
+      { name: 'Content-Type', value: 'text/plain' },
+    ]);
+  });
+  it('should not allow an empty header name', () => {
+    const requestGroups = [
+      {
+        headers: [
+          { name: '', value: 'bar' },
+          { name: ' ', value: 'foo' },
+        ],
+      },
+    ];
+    const request = {
+      headers: [
+        { name: '', value: 'baz' },
+        { name: '     ', value: 'qux' },
+      ],
+    };
+    expect(networkUtils.getOrInheritHeaders({ request, requestGroups })).toEqual([]);
+  });
+});
+
+describe('cookie template rendering by source', () => {
+  // getRenderedRequestAndContext renders the whole cookie jar before every send (it's how
+  // {{ _.var }} works in a manually-typed cookie), so a response-sourced cookie's value must
+  // never reach the renderer here, or a template placed in a cookie by a response would be
+  // re-executed on every later request to that host.
+  const templateCookieValue = "{% uuid 'v4' %}";
+
+  it('does not render a response-sourced cookie value when preparing a request to send', async () => {
+    const workspace = await services.workspace.create();
+    const cookieJar = await services.cookieJar.getOrCreateForParentId(workspace._id);
+    await services.cookieJar.update(cookieJar, {
+      cookies: [
+        {
+          id: 'c1',
+          key: 'tracking',
+          value: templateCookieValue,
+          domain: 'localhost',
+          path: '/',
+          secure: false,
+          httpOnly: false,
+          source: 'response',
+        },
+      ],
+    });
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_response_cookie',
+      parentId: workspace._id,
+      url: 'http://localhost',
+    });
+
+    const renderedRequest = await getRenderedRequest({ request });
+    const responseCookie = renderedRequest.cookieJar.cookies.find(c => c.key === 'tracking');
+
+    expect(responseCookie?.value).toBe(templateCookieValue);
+  });
+
+  it('still renders a manually-authored cookie value when preparing a request to send', async () => {
+    const workspace = await services.workspace.create();
+    const cookieJar = await services.cookieJar.getOrCreateForParentId(workspace._id);
+    await services.cookieJar.update(cookieJar, {
+      cookies: [
+        {
+          id: 'c2',
+          key: 'session',
+          value: templateCookieValue,
+          domain: 'localhost',
+          path: '/',
+          secure: false,
+          httpOnly: false,
+          source: 'manual',
+        },
+      ],
+    });
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_manual_cookie',
+      parentId: workspace._id,
+      url: 'http://localhost',
+    });
+
+    const renderedRequest = await getRenderedRequest({ request });
+    const sessionCookie = renderedRequest.cookieJar.cookies.find(c => c.key === 'session');
+
+    expect(sessionCookie?.value).not.toBe(templateCookieValue);
+    expect(sessionCookie?.value).toMatch(/^[0-9a-f-]{36}$/);
+  });
+});
+
+describe('response tag template rendering', () => {
+  // A stored response's body/headers can contain template syntax. The {% response %} tag pulls
+  // that raw content into another request's field, so render() must not treat the tag's
+  // returned content as a second template pass, or a value that only reached the render
+  // context via a prior response would be evaluated as a live template.
+  const nestedTemplateHeaderValue = "{% set x = 'value' %}{{x}}";
+
+  it('does not re-render template syntax pulled in from a stored response header', async () => {
+    const workspace = await services.workspace.create();
+    const sourceRequest = await services.request.create({
+      parentId: workspace._id,
+      url: 'http://localhost/source',
+    });
+    await services.response.create({
+      parentId: sourceRequest._id,
+      statusCode: 200,
+      statusMessage: 'OK',
+      headers: [{ name: 'X-Source', value: nestedTemplateHeaderValue }],
+      contentType: 'text/plain',
+    });
+
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_response_tag_test',
+      parentId: workspace._id,
+      url: 'http://localhost/target',
+      headers: [{ name: 'X-Forwarded', value: `{% response 'header', '${sourceRequest._id}', 'X-Source', 'never', 60 %}` }],
+    });
+
+    const renderedRequest = await getRenderedRequest({ request });
+    const forwardedHeader = renderedRequest.headers.find(h => h.name === 'X-Forwarded');
+
+    expect(forwardedHeader?.value).toBe(nestedTemplateHeaderValue);
+  });
+
+  it('does not re-render template syntax pulled in from an OAuth2 access token via the request tag', async () => {
+    const workspace = await services.workspace.create();
+    const maliciousAccessToken = "{% set x = 'pwned' %}{{x}}";
+    const request = await services.request.create({
+      parentId: workspace._id,
+      url: 'http://localhost/target',
+      headers: [{ name: 'X-Forwarded-Token', value: "{% request 'oauth2' %}" }],
+    });
+    await services.oAuth2Token.create({
+      parentId: request._id,
+      accessToken: maliciousAccessToken,
+    });
+
+    const renderedRequest = await getRenderedRequest({ request });
+    const forwardedHeader = renderedRequest.headers.find(h => h.name === 'X-Forwarded-Token');
+
+    expect(forwardedHeader?.value).toBe(maliciousAccessToken);
+  });
+});
+
+describe('getRenderedRequest suppressUserAgent', () => {
+  it('suppresses default user-agent when a custom user-agent header is disabled', async () => {
+    const workspace = await services.workspace.create();
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_disabled_ua',
+      parentId: workspace._id,
+      url: 'http://localhost',
+      headers: [{ name: 'User-Agent', value: 'custom-xx', disabled: true }],
+    });
+
+    expect((await getRenderedRequest({ request })).suppressUserAgent).toBe(true);
+  });
+
+  it('suppresses default user-agent when all inherited user-agent headers are disabled', async () => {
+    const workspace = await services.workspace.create();
+    const folder = await services.requestGroup.create({
+      _id: 'fld_disabled_ua',
+      name: 'Disabled UA Folder',
+      parentId: workspace._id,
+      metaSortKey: 0,
+      headers: [{ name: 'User-Agent', value: 'custom-xx', disabled: true }],
+    });
+    const request = Object.assign(models.request.init(), {
+      _id: 'req_inherited_disabled_ua',
+      parentId: folder._id,
+      url: 'http://localhost',
+    });
+
+    expect((await getRenderedRequest({ request })).suppressUserAgent).toBe(true);
+  });
+});

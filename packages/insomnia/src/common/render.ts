@@ -1,0 +1,1023 @@
+import clone from 'clone';
+import type {
+  Environment,
+  EnvironmentKvPairData,
+  GrpcRequest,
+  GrpcRequestBody,
+  McpRequest,
+  Request,
+  RequestGroup,
+  SocketIORequest,
+  UserUploadEnvironment,
+  WebSocketRequest,
+  Workspace,
+} from 'insomnia-data';
+import { EnvironmentKvPairDataType, models, services } from 'insomnia-data';
+import { setDefaultProtocol } from 'insomnia-data/common';
+import orderedJSON from 'json-order';
+
+import {
+  collectLeafValues,
+  getConfidentialBasicAuthHeaderValue,
+  type SensitiveValueCollector,
+} from '~/common/network/sensitive-value-collector';
+import {
+  CONFIDENTIAL_MASK_VALUE,
+  type ConfidentialValueKind,
+  getConfidentialValuePolicy,
+} from '~/common/templating/confidential-value-policy';
+import { NUNJUCKS_TEMPLATE_GLOBAL_PROPERTY_NAME } from '~/common/templating/constants';
+import { maskOrDecryptVaultDataIfNecessary } from '~/common/templating/mask-or-decrypt-vault-data';
+import { RenderError } from '~/common/templating/render-error';
+import type {
+  BaseRenderContext,
+  BaseRenderContextOptions,
+  RenderContextAncestor,
+  RenderContextOptions,
+  RenderedRequest,
+  VariableSourceMeta,
+} from '~/common/templating/types';
+import * as templatingUtils from '~/common/templating/utils';
+
+import { getOrInheritAuthentication, getOrInheritHeaders, shouldSuppressUserAgent } from '../network/network';
+import { getRuntime } from '../runtimes';
+import { CONTENT_TYPE_GRAPHQL, JSON_ORDER_SEPARATOR } from './constants';
+import { database as db } from './database';
+
+const { applyPathParametersToUrl } = models.request;
+const { isRequestGroup } = models.requestGroup;
+
+// Source labels read as `<environment type> : <name>`; the type alone stands in
+// when an environment has no name.
+const formatSourceLabel = (type: string, name?: string) => (name ? `${type} : ${name}` : type);
+
+// Function that gets Keys and stores their Source location
+function getKeySource(
+  subObject: string | Record<string, any>,
+  inKey: string,
+  meta: VariableSourceMeta,
+  keySource: Record<string, string>,
+  keySourceMeta: Record<string, VariableSourceMeta>,
+) {
+  // Add key to map if it's not root
+  if (inKey) {
+    const normalizedKey = templatingUtils.normalizeToDotAndBracketNotation(inKey);
+    // The label doubles as the keySource entry the "Template tags show variable source and value"
+    // setting renders. Transient sources (runner upload data, script-local
+    // variables) carry no workspaceId, so overwriting an environment's metadata
+    // with one of these keeps consumers honest without becoming navigable.
+    keySource[normalizedKey] = meta.label;
+    keySourceMeta[normalizedKey] = meta;
+  }
+
+  // Recurse down for Objects and Arrays
+  const typeStr = Object.prototype.toString.call(subObject);
+
+  if (typeStr === '[object Object]') {
+    for (const key of Object.keys(subObject)) {
+      // @ts-expect-error -- mapping unsoundness
+      getKeySource(subObject[key], templatingUtils.forceBracketNotation(inKey, key), meta, keySource, keySourceMeta);
+    }
+  } else if (typeStr === '[object Array]' && Array.isArray(subObject)) {
+    for (const [i, element] of subObject.entries()) {
+      getKeySource(element, templatingUtils.forceBracketNotation(inKey, i), meta, keySource, keySourceMeta);
+    }
+  }
+}
+
+interface EnvironmentRenderLayer {
+  data: Record<string, any>;
+  kvPairData?: EnvironmentKvPairData[];
+  source: 'global' | 'collection' | 'folder' | 'iteration' | 'transient';
+  // Per-layer source attribution for the "Template tags show variable source
+  // and value" setting; layers that define no variables of their own carry none.
+  meta?: VariableSourceMeta;
+}
+
+// Builds a name → ConfidentialValueKind lookup for one environment layer.
+// SECRET rows are intentionally excluded: they are handled separately by
+// maskOrDecryptVaultDataIfNecessary and must not be double-processed here.
+// Disabled rows are excluded to match getDataFromKVPair semantics — they
+// do not appear in `data` either.
+// If the same name appears more than once, the last enabled non-SECRET row
+// wins (consistent with getDataFromKVPair last-wins behaviour).
+function getConfidentialityByKey(kvPairData?: EnvironmentKvPairData[]) {
+  const confidentialityByKey = new Map<string, ConfidentialValueKind | undefined>();
+
+  for (const pair of kvPairData || []) {
+    if (!pair.enabled || pair.type === EnvironmentKvPairDataType.SECRET) {
+      continue;
+    }
+    confidentialityByKey.set(pair.name, pair.isConfidential ? 'normal' : undefined);
+  }
+
+  return confidentialityByKey;
+}
+
+function maskConfidentialValue(value: any): any {
+  if (Array.isArray(value)) {
+    return value.map(maskConfidentialValue);
+  }
+
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, maskConfidentialValue(child)]));
+  }
+
+  return models.environment.vaultEnvironmentMaskValue;
+}
+
+export function buildEnvironmentRenderLayers({
+  ancestors,
+  rootEnvironment,
+  subEnvironment,
+  rootGlobalEnvironment,
+  subGlobalEnvironment,
+  userUploadEnvironment,
+  transientVariables,
+  workspaceId,
+  isEnvironmentWorkspace,
+}: {
+  ancestors?: RenderContextAncestor[];
+  rootEnvironment?: Environment;
+  subEnvironment?: Environment;
+  rootGlobalEnvironment?: Environment | null;
+  subGlobalEnvironment?: Environment | null;
+  userUploadEnvironment?: UserUploadEnvironment;
+  transientVariables?: Environment;
+  // Collection and folder layers attribute their source to this workspace.
+  workspaceId?: string;
+  // True when the rendered workspace is a project environment file: its own base
+  // and sub environments are project environments, not collection environments.
+  isEnvironmentWorkspace?: boolean;
+}): EnvironmentRenderLayer[] {
+  const environmentLayers: EnvironmentRenderLayer[] = [];
+  const workspaceEnvironmentLabel = isEnvironmentWorkspace ? 'Project Environment' : 'Collection Environment';
+
+  if (rootGlobalEnvironment) {
+    const ordered = orderedJSON.order(
+      rootGlobalEnvironment.data,
+      rootGlobalEnvironment.dataPropertyOrder ?? null,
+      JSON_ORDER_SEPARATOR,
+    );
+    environmentLayers.push({
+      data: ordered,
+      kvPairData: rootGlobalEnvironment.kvPairData,
+      source: 'global',
+      meta: {
+        label: formatSourceLabel('Project Environment', rootGlobalEnvironment.name),
+        workspaceId: rootGlobalEnvironment.parentId,
+        environmentId: rootGlobalEnvironment._id,
+      },
+    });
+  }
+
+  if (subGlobalEnvironment) {
+    const ordered = orderedJSON.order(
+      subGlobalEnvironment.data,
+      subGlobalEnvironment.dataPropertyOrder ?? null,
+      JSON_ORDER_SEPARATOR,
+    );
+    environmentLayers.push({
+      data: ordered,
+      kvPairData: subGlobalEnvironment.kvPairData,
+      source: 'global',
+      meta: {
+        label: formatSourceLabel('Project Environment', subGlobalEnvironment.name),
+        workspaceId: rootGlobalEnvironment?.parentId,
+        environmentId: subGlobalEnvironment._id,
+      },
+    });
+  }
+
+  // Get root environment keys in correct order
+  // Then get sub environment keys in correct order
+  // Then get ancestor (folder) environment keys in correct order
+  if (rootEnvironment) {
+    const ordered = orderedJSON.order(
+      rootEnvironment.data,
+      rootEnvironment.dataPropertyOrder ?? null,
+      JSON_ORDER_SEPARATOR,
+    );
+    environmentLayers.push({
+      data: ordered,
+      kvPairData: rootEnvironment.kvPairData,
+      source: 'collection',
+      meta: {
+        label: formatSourceLabel(workspaceEnvironmentLabel, rootEnvironment.name),
+        workspaceId: workspaceId,
+        environmentId: rootEnvironment._id,
+      },
+    });
+  }
+
+  if (subEnvironment) {
+    const ordered = orderedJSON.order(
+      subEnvironment.data,
+      subEnvironment.dataPropertyOrder ?? null,
+      JSON_ORDER_SEPARATOR,
+    );
+    environmentLayers.push({
+      data: ordered,
+      kvPairData: subEnvironment.kvPairData,
+      source: 'collection',
+      // The active sub environment can be the base environment itself; only a
+      // distinct sub environment carries its own source attribution.
+      meta:
+        subEnvironment._id !== rootEnvironment?._id
+          ? {
+              label: formatSourceLabel(workspaceEnvironmentLabel, subEnvironment.name),
+              workspaceId: workspaceId,
+              environmentId: subEnvironment._id,
+            }
+          : undefined,
+    });
+  }
+
+  for (const doc of [...(ancestors || [])].reverse()) {
+    const ancestor: any = doc;
+    const { environment, environmentPropertyOrder, kvPairData } = ancestor;
+
+    if (typeof environment === 'object' && environment !== null) {
+      const ordered = orderedJSON.order(environment, environmentPropertyOrder ?? null, JSON_ORDER_SEPARATOR);
+      environmentLayers.push({
+        data: ordered,
+        kvPairData,
+        source: 'folder',
+        // Only folder environments carry source metadata; the request and workspace
+        // ancestors define no variables of their own.
+        meta:
+          isRequestGroup(ancestor) && 'name' in ancestor
+            ? {
+                label: formatSourceLabel('Folder Environment', ancestor.name),
+                workspaceId: workspaceId,
+                requestGroupId: ancestor._id,
+              }
+            : undefined,
+      });
+    }
+  }
+
+  // user upload env in collection runner has highest priority except local variables
+  if (userUploadEnvironment) {
+    const ordered = orderedJSON.order(
+      userUploadEnvironment.data,
+      userUploadEnvironment.dataPropertyOrder ?? null,
+      JSON_ORDER_SEPARATOR,
+    );
+    environmentLayers.push({
+      data: ordered,
+      source: 'iteration',
+      meta: { label: formatSourceLabel('Upload Data', userUploadEnvironment.name) },
+    });
+  }
+
+  // script local variables (insomnia.variable.set) has highest priority
+  if (transientVariables) {
+    const ordered = orderedJSON.order(
+      transientVariables.data,
+      transientVariables.dataPropertyOrder ?? null,
+      JSON_ORDER_SEPARATOR,
+    );
+    environmentLayers.push({
+      data: ordered,
+      source: 'transient',
+      meta: { label: formatSourceLabel('Script Variables', transientVariables.name) },
+    });
+  }
+
+  return environmentLayers;
+}
+
+// Registers the confidential values of already-built environment layers into the collector:
+// the confidential *flags* come from each layer's kvPairData, the *values* from that layer's
+// `data`. That is the same split buildRenderContext uses at render time
+// (getConfidentialityByKey for the flags, the merged context for the values), and it is what
+// lets this helper also serve post-script registration in tryToExecuteScript, where only the
+// script's output data exists and no kvPairData has been regenerated for it yet.
+//
+// Reusing getConfidentialityByKey means disabled rows, SECRET rows (registered separately by
+// maskOrDecryptVaultDataIfNecessary) and duplicate names (last enabled row wins) are all
+// handled exactly as they are during render.
+export function registerConfidentialValues(
+  layers: { data: Record<string, any>; kvPairData?: EnvironmentKvPairData[] }[],
+  collector: SensitiveValueCollector,
+): void {
+  for (const layer of layers) {
+    for (const [name, kind] of getConfidentialityByKey(layer.kvPairData)) {
+      if (kind !== 'normal') {
+        continue;
+      }
+      // Undefined (a row whose name isn't in data) is a no-op in collectLeafValues.
+      collectLeafValues(layer.data[name], collector);
+    }
+  }
+}
+
+// Enumerates the same five confidential-capable layers as buildEnvironmentRenderLayers
+// (rootGlobal, subGlobal, rootEnvironment, subEnvironment, folder ancestors) and registers
+// every confidential value's raw, unrendered form into the collector.
+//
+// Used to pre-fill a collector before a pre-request script runs or a WebSocket/MCP
+// connection is opened, i.e. before any render pass would otherwise register these values.
+// This covers early-exit paths (a pre-request script that throws, skipRequest, a connection
+// that's closed before its first message) where the normal render-time registration never runs.
+//
+// iteration/transient layers are intentionally excluded: they carry no kvPairData and can
+// never be confidential (see buildEnvironmentRenderLayers).
+export function collectConfidentialRawValues(
+  {
+    ancestors,
+    rootEnvironment,
+    subEnvironment,
+    rootGlobalEnvironment,
+    subGlobalEnvironment,
+  }: {
+    ancestors?: RenderContextAncestor[];
+    rootEnvironment?: Environment;
+    subEnvironment?: Environment;
+    rootGlobalEnvironment?: Environment | null;
+    subGlobalEnvironment?: Environment | null;
+  },
+  collector: SensitiveValueCollector,
+): void {
+  registerConfidentialValues(
+    buildEnvironmentRenderLayers({
+      ancestors,
+      rootEnvironment,
+      subEnvironment,
+      rootGlobalEnvironment,
+      subGlobalEnvironment,
+    }),
+    collector,
+  );
+}
+
+export async function buildRenderContext({
+  ancestors,
+  rootEnvironment,
+  subEnvironment,
+  rootGlobalEnvironment,
+  subGlobalEnvironment,
+  userUploadEnvironment,
+  transientVariables,
+  baseContext,
+  isEnvironmentWorkspace,
+}: {
+  ancestors?: RenderContextAncestor[];
+  rootEnvironment?: Environment;
+  subEnvironment?: Environment;
+  rootGlobalEnvironment?: Environment | null;
+  subGlobalEnvironment?: Environment | null;
+  userUploadEnvironment?: UserUploadEnvironment;
+  transientVariables?: Environment;
+  baseContext: Omit<BaseRenderContext, 'getKeysContext'>;
+  isEnvironmentWorkspace?: boolean;
+}): Promise<BaseRenderContext> {
+  // Per-key source attribution, recorded while the environments merge below so it
+  // follows the same merge order and winners as the values.
+  const keySource: Record<string, string> = {};
+  const keySourceMeta: Record<string, VariableSourceMeta> = {};
+  const environmentLayers = buildEnvironmentRenderLayers({
+    ancestors,
+    rootEnvironment,
+    subEnvironment,
+    rootGlobalEnvironment,
+    subGlobalEnvironment,
+    userUploadEnvironment,
+    transientVariables,
+    workspaceId: baseContext.getMeta().workspaceId,
+    isEnvironmentWorkspace,
+  });
+
+  // At this point, environments is a list of environments ordered
+  // from top-most parent to bottom-most child, and they keys in each environment
+  // ordered by its property map.
+  // Do an Object.assign, but render each property as it overwrites. This
+  // way we can keep same-name variables from the parent context.
+  // BaseRenderContext carries a string index signature, so the spread needs an
+  // explicit annotation to keep the named members.
+  const renderContext = {
+    ...baseContext,
+    getKeysContext: () => ({
+      keyContext: keySource,
+      keyContextMeta: keySourceMeta,
+    }),
+  } as BaseRenderContext;
+
+  // Made the rendering into a recursive function to handle nested Objects
+  async function renderSubContext(subObject: Record<string, any>, subContext: BaseRenderContext) {
+    const keys = _getOrderedEnvironmentKeys(subObject);
+
+    for (const key of keys) {
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+        continue;
+      }
+      /*
+       * If we're overwriting a string, try to render it first using the same key from the base
+       * environment to support same-variable recursion. This allows for the following scenario:
+       *
+       * base:  { base_url: 'google.com' }
+       * obj:   { base_url: '{{ base_url }}/foo' }
+       * final: { base_url: 'google.com/foo' }
+       *
+       * A regular Object.assign would yield { base_url: '{{ base_url }}/foo' } and the
+       * original base_url of google.com would be lost.
+       */
+      if (Object.prototype.toString.call(subObject[key]) === '[object String]') {
+        const isSelfRecursive = subObject[key].match(`{{ ?${key}[ |][^}]*}}`);
+
+        // If we're overwriting a variable that contains itself, make sure we
+        // render it first
+        // Only render with key being overwritten
+        // Otherwise it's just a regular replacement
+        subContext[key] = isSelfRecursive
+          ? await render(subObject[key], subContext, null, 'keep', 'Environment')
+          : subObject[key];
+      } else if (Object.prototype.toString.call(subContext[key]) === '[object Object]') {
+        // Context is of Type object, Call this function recursively to handle nested objects.
+        subContext[key] = await renderSubContext(subObject[key], subContext[key]);
+      } else {
+        // For all other Types, add the Object to the Context.
+        subContext[key] = subObject[key];
+      }
+    }
+
+    return subContext;
+  }
+  let finalRenderContext = { ...renderContext };
+
+  // Cross-layer confidentiality accumulator. Updated on every key as layers are
+  // merged in priority order (low → high). When a higher-priority layer defines
+  // the same key, its confidentiality verdict overwrites the previous one — including
+  // setting it to undefined when the higher-priority layer has no kvPairData entry
+  // for that key (e.g. iteration/transient layers), which intentionally clears the
+  // confidential flag so a public override is not masked.
+  const confidentialityByKey = new Map<string, ConfidentialValueKind | undefined>();
+  const hideSecretValues = renderContext?.getSettings?.().hideSecretValuesInPreviewAndConsole;
+  const forceReveal = renderContext?.getSettings?.().forceReveal;
+  // Hoisted above both loops: purpose/hideSecretValues/forceReveal are invariant for the
+  // entire buildRenderContext call. undefined purpose hits the fail-closed 'mask' branch,
+  // so file-export paths (explicit HAR, etc.) always mask confidential values — consistent
+  // with SECRET behaviour and independent of the hideSecretValuesInPreviewAndConsole setting.
+  const purpose = renderContext?.getPurpose?.();
+  const confidentialPolicy = getConfidentialValuePolicy({ purpose, hideSecretValues, forceReveal });
+
+  for (const environmentLayer of environmentLayers) {
+    // Per-layer lookup built from kvPairData metadata (not from data values).
+    const layerConfidentialityByKey = getConfidentialityByKey(environmentLayer.kvPairData);
+    // Build a masked copy of this layer's data before merging into the context.
+    // Masking must happen here — after this point the values enter renderSubContext
+    // where they may be rendered into other variables, and we must never let a
+    // masked value be subsequently over-written with the real one from a cache or
+    // re-render of the same context.
+    const renderableData: Record<string, any> = {};
+
+    for (const [key, value] of Object.entries(environmentLayer.data)) {
+      // Overwrite the accumulated confidentiality with this layer's verdict.
+      // layerConfidentialityByKey.get(key) returns undefined for keys that have
+      // no kvPairData (e.g. raw-JSON layers, iteration data), which is the
+      // correct "public" signal and clears any confidentiality from lower layers.
+      confidentialityByKey.set(key, layerConfidentialityByKey.get(key));
+      const confidentiality = confidentialityByKey.get(key);
+      renderableData[key] = confidentiality && confidentialPolicy === 'mask' ? maskConfidentialValue(value) : value;
+    }
+
+    finalRenderContext = await renderSubContext(renderableData, finalRenderContext);
+  }
+
+  // Key source attribution, registered in the same order the runtime merges the
+  // environments: sealed values of every environment first, then the plain walks —
+  // a legacy plaintext `vault` key (which import and sync carry without
+  // reserved-key validation) wins over sealed values, mirroring the vault merge
+  // below. Vault secrets are stored under the reserved `__insomnia_vault` key and
+  // surface at runtime under the `vault` namespace, so their leaves are recorded
+  // there for `_.vault.key` chips; the reserved key itself is never exposed.
+  const inKey = NUNJUCKS_TEMPLATE_GLOBAL_PROPERTY_NAME;
+
+  for (const { data, meta } of environmentLayers) {
+    if (!meta) {
+      continue;
+    }
+    const { [models.environment.vaultEnvironmentPath]: vaultData } = data ?? {};
+    if (vaultData && typeof vaultData === 'object' && !Array.isArray(vaultData)) {
+      getKeySource(
+        vaultData,
+        templatingUtils.forceBracketNotation(inKey, models.environment.vaultEnvironmentRuntimePath),
+        meta,
+        keySource,
+        keySourceMeta,
+      );
+    }
+  }
+
+  for (const { data, meta } of environmentLayers) {
+    if (!meta) {
+      continue;
+    }
+    const { [models.environment.vaultEnvironmentPath]: vault, ...plainData } = data ?? {};
+    getKeySource(plainData, inKey, meta, keySource, keySourceMeta);
+  }
+
+  const collector = baseContext?.getSensitiveValueCollector?.() ?? null;
+  const vaultEnvironmentData = await maskOrDecryptVaultDataIfNecessary({
+    vaultEnvironmentData: finalRenderContext[models.environment.vaultEnvironmentPath],
+    renderPurpose: purpose,
+    hideSecretValues,
+    forceReveal,
+    sensitiveValueCollector: collector,
+  });
+  if (vaultEnvironmentData) {
+    // avoid add undefined data to render context
+    finalRenderContext[models.environment.vaultEnvironmentPath] = vaultEnvironmentData;
+  }
+  // Merge all vault environments under vaultEnvironmentPath to vaultEnvironmentRuntimePath which is more human readable.
+  // This will also keep all legacy environment variables defined under the vaultEnvironmentRuntimePath.
+  if (finalRenderContext[models.environment.vaultEnvironmentPath]) {
+    if (
+      finalRenderContext[models.environment.vaultEnvironmentRuntimePath] &&
+      typeof finalRenderContext[models.environment.vaultEnvironmentRuntimePath] !== 'object'
+    ) {
+      const errorMsg = `${models.environment.vaultEnvironmentRuntimePath} is a reserved key for insomnia vault, please rename your environment with vault as key.`;
+      const newError = new RenderError(errorMsg);
+      newError.type = 'render';
+      newError.message = errorMsg;
+      throw newError;
+    }
+    finalRenderContext[models.environment.vaultEnvironmentRuntimePath] = {
+      ...finalRenderContext[models.environment.vaultEnvironmentPath],
+      ...finalRenderContext[models.environment.vaultEnvironmentRuntimePath],
+    };
+    delete finalRenderContext[models.environment.vaultEnvironmentPath];
+  }
+
+  const keys = _getOrderedEnvironmentKeys(finalRenderContext);
+
+  // Render recursive references and tags.
+  const skipNextTime: Record<string, boolean> = {};
+
+  for (let i = 0; i < 3; i++) {
+    for (const key of keys) {
+      // Skip rendering keys that stayed the same multiple times. This is here because
+      // a render failure will leave the tag as-is and thus the next iteration of the
+      // loop will try to re-render it again. We don't want to keep erroring on these
+      // because renders are expensive and potentially not idempotent.
+      if (skipNextTime[key]) {
+        continue;
+      }
+
+      const renderResult = await render(finalRenderContext[key], finalRenderContext, null, 'keep', 'Environment');
+
+      // Result didn't change, so skip
+      if (renderResult === finalRenderContext[key]) {
+        skipNextTime[key] = true;
+        continue;
+      }
+
+      finalRenderContext[key] = renderResult;
+    }
+  }
+
+  // Register fully-rendered normal confidential values for timeline redaction (purpose='send' only).
+  if (collector) {
+    for (const key of keys) {
+      if (confidentialityByKey.get(key) === 'normal') {
+        collectLeafValues(finalRenderContext[key], collector);
+      }
+    }
+  }
+
+  return finalRenderContext;
+}
+/**
+ * Recursively render any JS object and return a new one
+ * @param {*} obj - object to render
+ * @param {object} context - context to render against
+ * @param blacklistPathRegex - don't render these paths
+ * @param errorMode - how to handle errors
+ * @param name - name to include in error message
+ * @return {Promise.<*>}
+ */
+export async function render<T>(
+  obj: T,
+  context: BaseRenderContext,
+  blacklistPathRegex: RegExp | null = null,
+  errorMode: 'keep' | 'throw' = 'throw',
+  name = '',
+  ignoreUndefinedEnvVariable = false,
+) {
+  // Make a deep copy so no one gets mad :)
+  const newObj = clone(obj);
+
+  const undefinedEnvironmentVariables: string[] = [];
+
+  async function next<T>(input: T, path: string, first = false) {
+    if (blacklistPathRegex && path.match(blacklistPathRegex)) {
+      return input;
+    }
+
+    const asStr = Object.prototype.toString.call(input);
+
+    // Leave these types alone
+    if (
+      asStr === '[object Date]' ||
+      asStr === '[object RegExp]' ||
+      asStr === '[object Error]' ||
+      asStr === '[object Boolean]' ||
+      asStr === '[object Number]' ||
+      asStr === '[object Null]' ||
+      asStr === '[object Undefined]'
+    ) {
+      // Do nothing to these types
+    } else if (typeof input === 'string') {
+      const hasNunjucksInterpolationSymbols = input.includes('{{') && input.includes('}}');
+      const hasNunjucksCustomTagSymbols = input.includes('{%') && input.includes('%}');
+      const hasNunjucksCommentSymbols = input.includes('{#') && input.includes('#}');
+
+      if (!hasNunjucksInterpolationSymbols && !hasNunjucksCustomTagSymbols && !hasNunjucksCommentSymbols) {
+        return input;
+      }
+
+      if (input === '') {
+        return input;
+      }
+
+      try {
+        const sensitiveValueCollector = context?.getSensitiveValueCollector?.();
+        // @ts-expect-error -- TSCONVERSION
+        input = await getRuntime().templating.renderTemplate({ input, context, path, ignoreUndefinedEnvVariable, sensitiveValueCollector });
+
+        // If the variable outputs a tag, render it again. This is a common use
+        // case for environment variables:
+        //   {{ foo }} => {% uuid 'v4' %} => dd265685-16a3-4d76-a59c-e8264c16835a
+        // Gated on the ORIGINAL input lacking custom-tag syntax so that tags returning
+        // raw external content (response bodies, OAuth tokens, file contents) never have
+        // their output re-interpreted as a second template pass against the live context.
+        // @ts-expect-error -- TSCONVERSION
+        if (!hasNunjucksCustomTagSymbols && input.includes('{%')) {
+          // @ts-expect-error -- TSCONVERSION
+          input = await getRuntime().templating.renderTemplate({ input, context, path, ignoreUndefinedEnvVariable, sensitiveValueCollector });
+        }
+      } catch (err) {
+        console.log(`Failed to render element ${path}`, input);
+        if (errorMode !== 'keep') {
+          if (err?.extraInfo?.subType === 'environmentVariable') {
+            undefinedEnvironmentVariables.push(...err.extraInfo.undefinedEnvironmentVariables);
+          } else {
+            throw err;
+          }
+        }
+      }
+    } else if (Array.isArray(input)) {
+      for (let i = 0; i < input.length; i++) {
+        input[i] = await next(input[i], `${path}[${i}]`);
+      }
+    } else if (typeof input === 'object' && input !== null) {
+      // Don't even try rendering disabled objects
+      // Note, this logic probably shouldn't be here, but w/e for now
+      // @ts-expect-error -- TSCONVERSION
+      if (input.disabled) {
+        return input;
+      }
+
+      const keys = Object.keys(input);
+
+      for (const key of keys) {
+        if (first && key.indexOf('_') === 0) {
+          // @ts-expect-error -- mapping unsoundness
+          input[key] = await next(input[key], path);
+        } else {
+          const pathPrefix = path ? path + '.' : '';
+          // @ts-expect-error -- mapping unsoundness
+          input[key] = await next(input[key], `${pathPrefix}${key}`);
+        }
+      }
+    }
+
+    return input;
+  }
+
+  const renderResult = await next<T>(newObj, name, true);
+  if (undefinedEnvironmentVariables.length > 0) {
+    const error = new RenderError(
+      `Failed to render environment variables: ${undefinedEnvironmentVariables.join(', ')}`,
+    );
+    error.type = 'render';
+    error.extraInfo = {
+      subType: 'environmentVariable',
+      undefinedEnvironmentVariables,
+    };
+    throw error;
+  }
+
+  return renderResult;
+}
+
+export async function getRenderContext({
+  request,
+  environment,
+  baseEnvironment,
+  userUploadEnvironment,
+  transientVariables,
+  ancestors: _ancestors,
+  purpose,
+  extraInfo,
+  forceReveal,
+  sensitiveValueCollector,
+}: RenderContextOptions): Promise<BaseRenderContext> {
+  const ancestors = _ancestors || (await getRenderContextAncestors(request));
+
+  const project = ancestors.find(models.project.isProject);
+  const workspace = ancestors.find(models.workspace.isWorkspace);
+  if (!workspace) {
+    throw new Error('Failed to render. Could not find workspace');
+  }
+
+  const workspaceMeta = await services.workspaceMeta.getByParentId(workspace._id);
+
+  let rootGlobalEnvironment: Environment | null = null;
+  let subGlobalEnvironment: Environment | null = null;
+
+  if (workspaceMeta?.activeGlobalEnvironmentId) {
+    const activeGlobalEnvironment = await services.environment.getById(workspaceMeta.activeGlobalEnvironmentId);
+
+    if (activeGlobalEnvironment) {
+      if (activeGlobalEnvironment?.parentId.startsWith('wrk_')) {
+        rootGlobalEnvironment = activeGlobalEnvironment;
+      } else {
+        subGlobalEnvironment = activeGlobalEnvironment;
+
+        const baseGlobalEnvironment = await services.environment.getById(activeGlobalEnvironment.parentId);
+
+        if (baseGlobalEnvironment) {
+          rootGlobalEnvironment = baseGlobalEnvironment;
+        }
+      }
+    }
+  }
+
+  const rootEnvironment =
+    baseEnvironment || (await services.environment.getOrCreateForParentId(workspace ? workspace._id : 'n/a'));
+  const subEnvironmentId = environment ? (typeof environment === 'string' ? environment : environment._id) : 'n/a';
+  const subEnvironment = environment
+    ? typeof environment === 'string'
+      ? await services.environment.getById(environment)
+      : environment
+    : await services.environment.getById('n/a');
+
+  const settings = await services.settings.get();
+
+  // Add meta data helper function
+  const baseContext: Omit<BaseRenderContext, 'getKeysContext'> = {
+    getMeta: () => ({
+      requestId: request?._id,
+      workspaceId: workspace?._id,
+    }),
+    getPurpose: () => purpose,
+    getExtraInfo: () => extraInfo,
+    getEnvironmentId: () => subEnvironmentId,
+    getGlobalEnvironmentId: () => subGlobalEnvironment?._id || rootGlobalEnvironment?._id,
+    // It is possible for a project to not exist because this code path can be reached via Inso which has no concept of a project.
+    getProjectId: () => project?._id,
+    getSettings: () => ({
+      dataFolders: settings.dataFolders,
+      hideSecretValuesInPreviewAndConsole: settings.hideSecretValuesInPreviewAndConsole,
+      forceReveal: forceReveal,
+    }),
+    ...(sensitiveValueCollector != null ? { getSensitiveValueCollector: () => sensitiveValueCollector } : {}),
+  };
+
+  // Generate the context we need to render
+  return buildRenderContext({
+    ancestors,
+    rootGlobalEnvironment,
+    subGlobalEnvironment,
+    rootEnvironment,
+    subEnvironment: subEnvironment || undefined,
+    userUploadEnvironment,
+    transientVariables,
+    baseContext,
+    // On a project environment page the active workspace is the environment file
+    // itself; its own environments must not be attributed to a collection.
+    isEnvironmentWorkspace: models.workspace.isEnvironment(workspace),
+  });
+}
+
+export async function getRenderedGrpcRequest({
+  purpose,
+  extraInfo,
+  request,
+  environment,
+  skipBody,
+}: BaseRenderContextOptions & { request: GrpcRequest; skipBody?: boolean }) {
+  const renderContext = await getRenderContext({ request, environment, purpose, extraInfo });
+  const description = request.description;
+  // Render description separately because it's lower priority
+  request.description = '';
+  // Ignore body by default and only include if specified to
+  const ignorePathRegex = skipBody ? /^body.*/ : null;
+  // Render all request properties
+  const renderedRequest: GrpcRequest = await render(request, renderContext, ignorePathRegex);
+  renderedRequest.description = await render(description, renderContext, null, 'keep');
+  return renderedRequest;
+}
+
+export async function getRenderedGrpcRequestMessage({
+  environment,
+  request,
+  extraInfo,
+  purpose,
+  sensitiveValueCollector,
+}: BaseRenderContextOptions & { request: GrpcRequest }) {
+  const renderContext = await getRenderContext({ request, environment, purpose, extraInfo, sensitiveValueCollector });
+  // Render request body
+  const renderedBody: GrpcRequestBody = await render(request.body, renderContext);
+  return renderedBody;
+}
+
+export async function getRenderedRequestAndContext({
+  request,
+  environment,
+  baseEnvironment,
+  userUploadEnvironment,
+  transientVariables,
+  extraInfo,
+  purpose,
+  ignoreUndefinedEnvVariable,
+  sensitiveValueCollector,
+}: BaseRenderContextOptions & { request: Request }): Promise<{
+  request: RenderedRequest;
+  context: Record<string, any>;
+}> {
+  const ancestors = await getRenderContextAncestors(request);
+  const workspace = ancestors.find(models.workspace.isWorkspace);
+  // requestGroups is of order leaf to root
+  const requestGroups = ancestors.filter(isRequestGroup);
+
+  const parentId = workspace ? workspace._id : 'n/a';
+  const cookieJar = await services.cookieJar.getOrCreateForParentId(parentId);
+  const renderContext = await getRenderContext({
+    request,
+    environment,
+    ancestors,
+    purpose,
+    extraInfo,
+    baseEnvironment,
+    userUploadEnvironment,
+    transientVariables,
+    sensitiveValueCollector,
+  });
+
+  // HACK: Switch '#}' to '# }' to prevent Nunjucks from barfing
+  // https://github.com/kong/insomnia/issues/895
+  try {
+    if (request.body.text && request.body.mimeType === CONTENT_TYPE_GRAPHQL) {
+      const o = JSON.parse(request.body.text);
+      o.query = o.query.replace(/#}/g, '# }');
+      request.body.text = JSON.stringify(o);
+    }
+  } catch {}
+
+  // Render description separately because it's lower priority
+  const description = request.description;
+  request.description = '';
+
+  const suppressUserAgent = shouldSuppressUserAgent({ request, requestGroups });
+  request.headers = getOrInheritHeaders({ request, requestGroups });
+  request.authentication = getOrInheritAuthentication({ request, requestGroups });
+  // Only manually-authored cookies may contain live template syntax. Server-set cookie values
+  // are excluded from rendering here too, not just in the Cookie Jar UI, so that a template
+  // placed in a cookie by a response is never re-evaluated on a later request.
+  const manualCookies = cookieJar.cookies.filter(cookie => cookie.source === 'manual');
+  const nonManualCookies = cookieJar.cookies.filter(cookie => cookie.source !== 'manual');
+  // Render all request properties
+  const renderResult = await render(
+    {
+      _request: request,
+      _cookieJar: { ...cookieJar, cookies: manualCookies },
+    },
+    renderContext,
+    request.settingDisableRenderRequestBody ? /^body.*/ : null,
+    'throw',
+    '',
+    ignoreUndefinedEnvVariable,
+  );
+
+  const renderedRequest = renderResult._request;
+  const renderedCookieJar = {
+    ...renderResult._cookieJar,
+    cookies: [...renderResult._cookieJar.cookies, ...nonManualCookies],
+  };
+  renderedRequest.description = await render(description, renderContext, null, 'keep');
+  // Remove disabled params
+  renderedRequest.parameters = renderedRequest.parameters.filter(p => !p.disabled);
+  // Remove disabled headers
+  renderedRequest.headers = renderedRequest.headers.filter(p => !p.disabled);
+
+  // Remove disabled body params
+  if (renderedRequest.body && Array.isArray(renderedRequest.body.params)) {
+    renderedRequest.body.params = renderedRequest.body.params.filter(p => !p.disabled);
+  }
+
+  // Remove disabled authentication
+  if (
+    renderedRequest.authentication &&
+    'disabled' in renderedRequest.authentication &&
+    renderedRequest.authentication.disabled
+  ) {
+    renderedRequest.authentication = {};
+  }
+
+  // The Basic Auth header is built later (getAuthHeader) as base64(user:pass), which never matches
+  // the plaintext credentials registered during render, so the timeline would show it in the clear.
+  // Register the derived header too, but only when a credential actually was confidential.
+  if (sensitiveValueCollector && renderedRequest.authentication?.type === 'basic') {
+    const headerValue = getConfidentialBasicAuthHeaderValue(
+      sensitiveValueCollector.values,
+      renderedRequest.authentication,
+    );
+    if (headerValue) {
+      sensitiveValueCollector.register(headerValue);
+    }
+  }
+
+  // Default the proto if it doesn't exist. A URL starting with the mask (preview/export renders only;
+  // send never masks) may hide a confidential value that carries its own scheme, e.g. a baseUrl of
+  // `https://api.example.com`, so defaulting would show `http://••••••` for an https URL. Leave it as is.
+  if (!renderedRequest.url.trimStart().startsWith(CONFIDENTIAL_MASK_VALUE)) {
+    renderedRequest.url = setDefaultProtocol(renderedRequest.url);
+  }
+
+  renderedRequest.url = applyPathParametersToUrl(renderedRequest.url, renderedRequest.pathParameters);
+
+  return {
+    context: renderContext,
+    request: {
+      suppressUserAgent,
+      cookieJar: renderedCookieJar,
+      cookies: [],
+      isPrivate: false,
+      _id: renderedRequest._id,
+      authentication: renderedRequest.authentication,
+      pathParameters: renderedRequest.pathParameters,
+      body: renderedRequest.body,
+      created: renderedRequest.created,
+      modified: renderedRequest.modified,
+      description: renderedRequest.description,
+      headers: renderedRequest.headers,
+      metaSortKey: renderedRequest.metaSortKey,
+      method: renderedRequest.method,
+      name: renderedRequest.name,
+      parameters: renderedRequest.parameters,
+      parentId: renderedRequest.parentId,
+      settingDisableRenderRequestBody: renderedRequest.settingDisableRenderRequestBody,
+      settingEncodeUrl: renderedRequest.settingEncodeUrl,
+      settingSendCookies: renderedRequest.settingSendCookies,
+      settingStoreCookies: renderedRequest.settingStoreCookies,
+      settingRebuildPath: renderedRequest.settingRebuildPath,
+      settingFollowRedirects: renderedRequest.settingFollowRedirects,
+      disableUserAgentHeader: renderedRequest.disableUserAgentHeader,
+      type: renderedRequest.type,
+      url: renderedRequest.url,
+      preRequestScript: renderedRequest.preRequestScript,
+      afterResponseScript: renderedRequest.afterResponseScript,
+    },
+  };
+}
+
+/**
+ * Sort the keys that may have Nunjucks last, so that other keys get
+ * defined first. Very important if env variables defined in same obj
+ * (eg. {"foo": "{{ bar }}", "bar": "Hello World!"})
+ *
+ * @param v
+ * @returns {number}
+ */
+function _nunjucksSortValue(v: string) {
+  return v?.match?.(/({{|{%)/) ? 2 : 1;
+}
+
+function _getOrderedEnvironmentKeys(finalRenderContext: Record<string, any>): string[] {
+  return Object.keys(finalRenderContext).sort((k1, k2) => {
+    const k1Sort = _nunjucksSortValue(finalRenderContext[k1]);
+
+    const k2Sort = _nunjucksSortValue(finalRenderContext[k2]);
+
+    return k1Sort - k2Sort;
+  });
+}
+
+export async function getRenderContextAncestors(
+  base?: Request | GrpcRequest | WebSocketRequest | SocketIORequest | McpRequest | RequestGroup | Workspace,
+): Promise<RenderContextAncestor[]> {
+  return await db.withAncestors<RenderContextAncestor>(base, [
+    models.request.type,
+    models.grpcRequest.type,
+    models.webSocketRequest.type,
+    models.mcpRequest.type,
+    models.requestGroup.type,
+    models.workspace.type,
+    models.project.type,
+    models.mockRoute.type,
+    models.mockServer.type,
+  ]);
+}

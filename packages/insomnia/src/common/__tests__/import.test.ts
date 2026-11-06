@@ -1,0 +1,886 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
+import type { McpRequest } from 'insomnia-data';
+import { EnvironmentKvPairDataType, EnvironmentType, models, services } from 'insomnia-data';
+import { describe, expect, it, vi } from 'vitest';
+import { parse } from 'yaml';
+
+import * as importUtil from '../import';
+import { INSOMNIA_SCHEMA_VERSION } from '../insomnia-schema-migrations/schema-version';
+import { getInsomniaV5DataExport, mcpUrlToInsomniaV5Yaml, tryImportV5Data } from '../insomnia-v5';
+import { generateId } from '../misc';
+
+describe('pathPatternMatches', () => {
+  it('should match exact paths', () => {
+    expect(importUtil.pathPatternMatches('/users', '/users')).toBe(true);
+    expect(importUtil.pathPatternMatches('/users/list', '/users/list')).toBe(true);
+  });
+
+  it('should not match different paths', () => {
+    expect(importUtil.pathPatternMatches('/users', '/user')).toBe(false);
+    expect(importUtil.pathPatternMatches('/users', '/users/123')).toBe(false);
+    expect(importUtil.pathPatternMatches('/users/list', '/users')).toBe(false);
+  });
+
+  it('should match paths with path parameters', () => {
+    expect(importUtil.pathPatternMatches('/users/:id', '/users/123')).toBe(true);
+    expect(importUtil.pathPatternMatches('/users/:userId/orders/:orderId', '/users/abc/orders/xyz')).toBe(true);
+    expect(importUtil.pathPatternMatches('/api/:version/resource', '/api/v1/resource')).toBe(true);
+  });
+
+  it('should not match when path param is empty', () => {
+    expect(importUtil.pathPatternMatches('/users/:id', '/users/')).toBe(false);
+    expect(importUtil.pathPatternMatches('/users/:id', '/users')).toBe(false);
+  });
+
+  it('should be case insensitive for static segments', () => {
+    expect(importUtil.pathPatternMatches('/Users', '/users')).toBe(true);
+    expect(importUtil.pathPatternMatches('/USERS/LIST', '/users/list')).toBe(true);
+    expect(importUtil.pathPatternMatches('/api/v1', '/API/V1')).toBe(true);
+  });
+
+  it('should handle empty pattern', () => {
+    expect(importUtil.pathPatternMatches('', '/users')).toBe(false);
+  });
+
+  it('should reject patterns over 200 characters', () => {
+    const longPattern = '/' + 'a'.repeat(200);
+    expect(importUtil.pathPatternMatches(longPattern, '/aaaa')).toBe(false);
+  });
+
+  it('should match paths with different segment counts (prefix matching)', () => {
+    expect(importUtil.pathPatternMatches('/basic', '/v1/basic')).toBe(true);
+    expect(importUtil.pathPatternMatches('/users', '/api/v1/users')).toBe(true);
+    expect(importUtil.pathPatternMatches('/key/header', '/v1/key/header')).toBe(true);
+  });
+
+  it('should handle leading slashes consistently', () => {
+    expect(importUtil.pathPatternMatches('users', 'users')).toBe(true);
+    expect(importUtil.pathPatternMatches('users', '/users')).toBe(true);
+    expect(importUtil.pathPatternMatches('/users', 'users')).toBe(true);
+  });
+});
+
+describe('mcpUrlToInsomniaV5Yaml', () => {
+  it('should produce YAML matching the MCP client export shape (schema_version, mcpRequest)', () => {
+    const yaml = importUtil.mcpUrlToInsomniaV5Yaml('https://example.com/mcp?x=1#y');
+    const doc = parse(yaml) as Record<string, unknown>;
+    expect(doc).toMatchObject({
+      type: 'mcpClient.insomnia/5.0',
+      schema_version: INSOMNIA_SCHEMA_VERSION,
+      name: 'Imported MCP Client',
+      mcpRequest: {
+        name: 'Imported MCP Client',
+        url: 'https://example.com/mcp?x=1#y',
+        transportType: 'streamable-http',
+      },
+    });
+  });
+
+  it.each([
+    ['https://example.com'],
+    ['https://example.com/mcp'],
+    ['https://example.com/mcp?param=value'],
+    ['https://example.com/mcp#fragment'],
+    ['http://examples.com/mcp'],
+  ])('should embed the MCP URL %s in mcpRequest.url', url => {
+    const doc = parse(importUtil.mcpUrlToInsomniaV5Yaml(url)) as { mcpRequest: { url: string } };
+    expect(doc.mcpRequest.url).toBe(url);
+  });
+
+  it('should throw an error if the MCP URL is not a valid HTTP URL', () => {
+    expect(() => importUtil.mcpUrlToInsomniaV5Yaml('ftp://example.com')).toThrow(
+      'MCP server URL must use http or https',
+    );
+    expect(() => importUtil.mcpUrlToInsomniaV5Yaml('not-a-url')).toThrow('Invalid URL: not-a-url');
+  });
+
+  it('escape sequences in the MCP URL are unmodified', () => {
+    const cases = ['https://example.com/foo\\nbar', 'https://example.com/foo\\tbar'] as const;
+    for (const input of cases) {
+      const yaml = importUtil.mcpUrlToInsomniaV5Yaml(input);
+      const doc = parse(yaml) as { mcpRequest: { url: string } };
+      expect(doc.mcpRequest.url).toBe(input);
+    }
+  });
+
+  it('should be accepted by the v5 importer', () => {
+    const yaml = importUtil.mcpUrlToInsomniaV5Yaml('https://example.com/mcp');
+    const { data, error } = tryImportV5Data(yaml);
+    expect(error).toBeUndefined();
+    expect(data.length).toBeGreaterThan(0);
+  });
+});
+
+/*
+@vitest-environment jsdom
+*/
+
+describe('isApiSpecImport()', () => {
+  it.each(['swagger2', 'openapi3'])('should return true if spec id is %o', (id: string) => {
+    expect(importUtil.isApiSpecImport({ id })).toBe(true);
+  });
+
+  it('should return false if spec id is not valid', () => {
+    const id = 'invalid-id';
+    expect(importUtil.isApiSpecImport({ id })).toBe(false);
+  });
+});
+
+describe('isInsomniaV4Import()', () => {
+  it.each(['insomnia-4'])('should return true if spec id is %o', (id: string) => {
+    expect(importUtil.isInsomniaV4Import({ id })).toBe(true);
+  });
+
+  it('should return false if spec id is not valid', () => {
+    const id = 'invalid-id';
+    expect(importUtil.isInsomniaV4Import({ id })).toBe(false);
+  });
+});
+
+describe('importRaw()', () => {
+  it('should import a curl request to a new workspace', async () => {
+    const fixturePath = path.join(__dirname, '..', '__fixtures__', 'curl', 'complex-input.sh');
+    const content = fs.readFileSync(fixturePath, 'utf8').toString();
+
+    const projectToImportTo = await services.project.create();
+
+    const scanResult = await importUtil.scanResources([
+      {
+        contentStr: content,
+      },
+    ]);
+
+    expect(scanResult[0].type?.id).toBe('curl');
+    expect(scanResult[0].errors.length).toBe(0);
+
+    await importUtil.importResourcesToProject({
+      projectId: projectToImportTo._id,
+    });
+
+    const workspacesCount = await services.workspace.count();
+    const projectWorkspaces = await services.workspace.listByParentId(projectToImportTo._id);
+    const curlRequests = await services.request.findByParentId(projectWorkspaces[0]._id);
+
+    expect(workspacesCount).toBe(1);
+
+    expect(curlRequests[0]).toMatchObject({
+      body: {
+        text: '{\"email_id\": \"tem_123\"}',
+      },
+    });
+  });
+
+  it('should call syncNewWorkspaceIfNeeded after importing to a new workspace', async () => {
+    const fixturePath = path.join(__dirname, '..', '__fixtures__', 'curl', 'complex-input.sh');
+    const content = fs.readFileSync(fixturePath, 'utf8').toString();
+
+    const projectToImportTo = await services.project.create();
+    const syncNewWorkspaceIfNeeded = vi.fn();
+
+    const scanResult = await importUtil.scanResources([
+      {
+        contentStr: content,
+      },
+    ]);
+
+    expect(scanResult[0].type?.id).toBe('curl');
+    expect(scanResult[0].errors.length).toBe(0);
+
+    await importUtil.importResourcesToProject({
+      projectId: projectToImportTo._id,
+      syncNewWorkspaceIfNeeded,
+    });
+
+    expect(syncNewWorkspaceIfNeeded).toHaveBeenCalledTimes(1);
+    expect(syncNewWorkspaceIfNeeded).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parentId: projectToImportTo._id,
+        scope: 'collection',
+      }),
+    );
+  });
+
+  it('should import a curl request to an existing workspace', async () => {
+    const fixturePath = path.join(__dirname, '..', '__fixtures__', 'curl', 'complex-input.sh');
+    const content = fs.readFileSync(fixturePath, 'utf8').toString();
+
+    const existingWorkspace = await services.workspace.create();
+
+    const scanResult = await importUtil.scanResources([
+      {
+        contentStr: content,
+      },
+    ]);
+
+    expect(scanResult[0].type?.id).toBe('curl');
+    expect(scanResult[0].errors.length).toBe(0);
+
+    await importUtil.importResourcesToWorkspace({
+      workspaceId: existingWorkspace._id,
+    });
+
+    const curlRequests = await services.request.findByParentId(existingWorkspace._id);
+
+    expect(curlRequests[0]).toMatchObject({
+      body: {
+        text: '{\"email_id\": \"tem_123\"}',
+      },
+    });
+  });
+
+  it('should import a postman collection to a new workspace', async () => {
+    const fixturePath = path.join(__dirname, '..', '__fixtures__', 'postman', 'aws-signature-auth-v2_0-input.json');
+    const content = fs.readFileSync(fixturePath, 'utf8').toString();
+    const projectToImportTo = await services.project.create();
+    const scanResult = await importUtil.scanResources([
+      {
+        contentStr: content,
+      },
+    ]);
+
+    expect(scanResult[0].type?.id).toBe('postman');
+    expect(scanResult[0].errors.length).toBe(0);
+
+    await importUtil.importResourcesToProject({
+      projectId: projectToImportTo._id,
+    });
+
+    const projectWorkspaces = await services.workspace.listByParentId(projectToImportTo._id);
+
+    const requestGroups = await services.requestGroup.findByParentId(projectWorkspaces[0]._id);
+    const requests = await services.request.findByParentId(requestGroups[0]._id);
+
+    expect(requests[0]).toMatchObject({
+      url: 'https://insomnia.rest',
+    });
+  });
+
+  it('should import a postman collection to an existing workspace', async () => {
+    const fixturePath = path.join(__dirname, '..', '__fixtures__', 'postman', 'aws-signature-auth-v2_0-input.json');
+    const content = fs.readFileSync(fixturePath, 'utf8').toString();
+
+    const existingWorkspace = await services.workspace.create();
+
+    const scanResult = await importUtil.scanResources([
+      {
+        contentStr: content,
+      },
+    ]);
+
+    expect(scanResult[0].type?.id).toBe('postman');
+    expect(scanResult[0].errors.length).toBe(0);
+
+    await importUtil.importResourcesToWorkspace({
+      workspaceId: existingWorkspace._id,
+    });
+
+    const requestGroups = await services.requestGroup.findByParentId(existingWorkspace._id);
+    const requests = await services.request.findByParentId(requestGroups[0]._id);
+
+    expect(requests[0]).toMatchObject({
+      url: 'https://insomnia.rest',
+    });
+  });
+
+  it('should import an openapi collection to an existing workspace with scope design', async () => {
+    const fixturePath = path.join(__dirname, '..', '__fixtures__', 'openapi', 'endpoint-security-input.yaml');
+    const content = fs.readFileSync(fixturePath, 'utf8').toString();
+    const disableLogs = console.log;
+    console.log = () => {};
+    const scanResult = await importUtil.scanResources([
+      {
+        contentStr: content,
+      },
+    ]);
+    console.log = disableLogs;
+    expect(scanResult[0].type?.id).toBe('openapi3');
+    expect(scanResult[0].errors.length).toBe(0);
+  });
+
+  it('should import a postman collection variable to a collection base environment', async () => {
+    const fixturePath = path.join(
+      __dirname,
+      '..',
+      '__fixtures__',
+      'postman',
+      'collection-with-variable-v2_1-input.json',
+    );
+    const content = fs.readFileSync(fixturePath, 'utf8').toString();
+
+    const projectToImportTo = await services.project.create();
+    const projectId = projectToImportTo._id;
+
+    const scanResult = await importUtil.scanResources([
+      {
+        contentStr: content,
+      },
+    ]);
+
+    expect(scanResult[0].type?.id).toBe('postman');
+    expect(scanResult[0].errors.length).toBe(0);
+
+    await importUtil.importResourcesToProject({
+      projectId: projectToImportTo._id,
+    });
+
+    const projectWorkspaces = await services.workspace.listByParentId(projectId);
+    const importedWorkspaceId = projectWorkspaces[0]._id;
+    const requestBaseEnvironment = await services.environment.getByParentId(importedWorkspaceId);
+
+    expect(requestBaseEnvironment).toBeDefined();
+
+    expect(requestBaseEnvironment!.data).toMatchObject({
+      from: 'variable',
+      foo: 'bar',
+    });
+  });
+
+  it('should merge the json base environment from a postman collection variable when imported inside a workspace', async () => {
+    const fixturePath = path.join(
+      __dirname,
+      '..',
+      '__fixtures__',
+      'postman',
+      'collection-with-variable-v2_1-input.json',
+    );
+    const content = fs.readFileSync(fixturePath, 'utf8').toString();
+
+    const existingWorkspace = await services.workspace.create();
+    const workspaceId = existingWorkspace._id;
+    const baseEnvironment = await services.environment.getOrCreateForParentId(workspaceId);
+    await services.environment.update(baseEnvironment, {
+      data: {
+        existingVar: 'exists',
+      },
+    });
+
+    const scanResult = await importUtil.scanResources([
+      {
+        contentStr: content,
+      },
+    ]);
+
+    expect(scanResult[0].type?.id).toBe('postman');
+    expect(scanResult[0].errors.length).toBe(0);
+
+    await importUtil.importResourcesToWorkspace({
+      workspaceId: existingWorkspace._id,
+    });
+
+    const updatedBaseEnvironment = await services.environment.getByParentId(workspaceId);
+
+    expect(updatedBaseEnvironment?.data).toMatchObject({
+      existingVar: 'exists',
+      from: 'variable',
+      foo: 'bar',
+    });
+  });
+
+  it('should override kv base environment from a postman collection variable when imported inside a workspace', async () => {
+    const fixturePath = path.join(
+      __dirname,
+      '..',
+      '__fixtures__',
+      'postman',
+      'collection-with-variable-v2_1-input.json',
+    );
+    const content = fs.readFileSync(fixturePath, 'utf8').toString();
+
+    const existingWorkspace = await services.workspace.create();
+    const workspaceId = existingWorkspace._id;
+    const baseEnvironmentPair = [
+      {
+        id: generateId('envPair'),
+        name: 'from',
+        value: 'baseEnv',
+        type: EnvironmentKvPairDataType.STRING,
+        enabled: true,
+      },
+      {
+        id: generateId('envPair'),
+        name: 'disabledItemKey',
+        value: 'disabledItemValue',
+        type: EnvironmentKvPairDataType.STRING,
+        enabled: false,
+      },
+    ];
+    const baseEnvironment = await services.environment.getOrCreateForParentId(workspaceId);
+    await services.environment.update(baseEnvironment, {
+      data: {
+        from: 'baseEnv',
+      },
+      environmentType: EnvironmentType.KVPAIR,
+      kvPairData: baseEnvironmentPair,
+    });
+
+    const scanResult = await importUtil.scanResources([
+      {
+        contentStr: content,
+      },
+    ]);
+
+    expect(scanResult[0].type?.id).toBe('postman');
+    expect(scanResult[0].errors.length).toBe(0);
+
+    await importUtil.importResourcesToWorkspace({
+      workspaceId: existingWorkspace._id,
+    });
+
+    const updatedBaseEnvironment = await services.environment.getByParentId(workspaceId);
+
+    expect(updatedBaseEnvironment?.data).toMatchObject({
+      from: 'variable',
+      foo: 'bar',
+    });
+    const newKvPairData = updatedBaseEnvironment?.kvPairData || [];
+    expect(newKvPairData.length).toBe(3);
+    expect(newKvPairData.filter(pair => pair.enabled).length).toBe(2);
+    expect(newKvPairData.find(pair => pair.name === 'from')?.value).toBe('variable');
+    expect(newKvPairData.find(pair => pair.name === 'foo')?.value).toBe('bar');
+  });
+
+  it('should merge and discard same name variable in kv base environment from a postman collection variable when imported inside a workspace', async () => {
+    const fixturePath = path.join(
+      __dirname,
+      '..',
+      '__fixtures__',
+      'postman',
+      'collection-with-variable-v2_1-input.json',
+    );
+    const content = fs.readFileSync(fixturePath, 'utf8').toString();
+
+    const existingWorkspace = await services.workspace.create();
+    const workspaceId = existingWorkspace._id;
+    const baseEnvironmentPair = [
+      {
+        id: generateId('envPair'),
+        name: 'from',
+        value: 'disabledValue',
+        type: EnvironmentKvPairDataType.STRING,
+        enabled: false,
+      },
+      {
+        id: generateId('envPair'),
+        name: 'from',
+        value: 'baseEnv',
+        type: EnvironmentKvPairDataType.STRING,
+        enabled: true,
+      },
+      {
+        id: generateId('envPair'),
+        name: 'disabledItemKey',
+        value: 'disabledItemValue',
+        type: EnvironmentKvPairDataType.STRING,
+        enabled: false,
+      },
+    ];
+    const baseEnvironment = await services.environment.getOrCreateForParentId(workspaceId);
+    await services.environment.update(baseEnvironment, {
+      data: {
+        from: 'baseEnv',
+      },
+      environmentType: EnvironmentType.KVPAIR,
+      kvPairData: baseEnvironmentPair,
+    });
+
+    const scanResult = await importUtil.scanResources([
+      {
+        contentStr: content,
+      },
+    ]);
+
+    expect(scanResult[0].type?.id).toBe('postman');
+    expect(scanResult[0].errors.length).toBe(0);
+
+    await importUtil.importResourcesToWorkspace({
+      workspaceId: existingWorkspace._id,
+      overrideBaseEnvironmentData: false,
+    });
+
+    const updatedBaseEnvironment = await services.environment.getByParentId(workspaceId);
+
+    expect(updatedBaseEnvironment?.data).toMatchObject({
+      from: 'baseEnv',
+      foo: 'bar',
+    });
+    const newKvPairData = updatedBaseEnvironment?.kvPairData || [];
+    expect(newKvPairData.length).toBe(4);
+    expect(newKvPairData.filter(pair => pair.enabled).length).toBe(2);
+    expect(newKvPairData.filter(pair => !pair.enabled).length).toBe(2);
+    expect(newKvPairData.find(pair => pair.name === 'from' && pair.enabled)?.value).toBe('baseEnv');
+    expect(newKvPairData.find(pair => pair.name === 'foo')?.value).toBe('bar');
+  });
+
+  it('concurrent scanResources calls should not duplicate the resource cache', async () => {
+    const proj = await services.project.create();
+    await Promise.all(
+      Array.from({ length: 5 }, (_, i) =>
+        importUtil.scanResources([{ contentStr: `curl -X POST https://${i}.test -d "n=${i}"` }]),
+      ),
+    );
+
+    const workspaces = await importUtil.importResourcesToProject({ projectId: proj._id });
+    expect(workspaces).toHaveLength(1);
+
+    const reqs = await services.request.findByParentId(workspaces[0]._id);
+    expect(reqs).toHaveLength(1);
+  });
+
+  it('should resolve operationId to method and name', async () => {
+    const fixturePath = path.join(__dirname, '..', '__fixtures__', 'openapi', 'smoke-test-with-operationIds.yaml');
+    const content = fs.readFileSync(fixturePath, 'utf8').toString();
+
+    await importUtil.scanResources([{ contentStr: content }]);
+
+    const result = importUtil.resolveOperationId('echoId');
+    expect(result).toBeDefined();
+    expect(result?.method).toBe('get');
+    expect(result?.name).toBe('Echo id');
+  });
+
+  it('should resolve operationId with path parameters in path', async () => {
+    const fixturePath = path.join(__dirname, '..', '__fixtures__', 'openapi', 'smoke-test-with-operationIds.yaml');
+    const content = fs.readFileSync(fixturePath, 'utf8').toString();
+
+    await importUtil.scanResources([{ contentStr: content }]);
+
+    const result = importUtil.resolveOperationId('delayByDuration');
+    expect(result).toBeDefined();
+    expect(result?.method).toBe('get');
+    expect(result?.name).toBe('Delay by seconds');
+  });
+
+  it('should return undefined for non-existent operationId', async () => {
+    const fixturePath = path.join(__dirname, '..', '__fixtures__', 'openapi', 'smoke-test-with-operationIds.yaml');
+    const content = fs.readFileSync(fixturePath, 'utf8').toString();
+
+    await importUtil.scanResources([{ contentStr: content }]);
+
+    const result = importUtil.resolveOperationId('nonExistentOpId');
+    expect(result).toBeUndefined();
+  });
+});
+
+describe('export/import round-trip is deterministic', () => {
+  // Exports a workspace to v5 YAML, imports it into a fresh project, and
+  // returns the single workspace that was created from the import.
+  const roundTrip = async (workspaceId: string) => {
+    const exported = await getInsomniaV5DataExport({ workspaceId, includePrivateEnvironments: true });
+    expect(exported).not.toBe('');
+
+    const scanResult = await importUtil.scanResources([{ contentStr: exported }]);
+    expect(scanResult[0].errors).toEqual([]);
+
+    const targetProject = await services.project.create();
+    const imported = await importUtil.importResourcesToProject({ projectId: targetProject._id });
+    expect(imported).toHaveLength(1);
+
+    return { exported, workspace: imported[0] };
+  };
+
+  it('preserves a design-doc spec without prepending the Insomnia v5 wrapper', async () => {
+    const openApiContents = [
+      'openapi: 3.0.4',
+      'info:',
+      '  title: Bookings API',
+      '  version: 1.0.0',
+      'paths:',
+      '  /bookings:',
+      '    get:',
+      '      summary: List bookings.',
+      '      responses:',
+      "        '200':",
+      '          description: Successful operation.',
+      '',
+    ].join('\n');
+
+    const sourceWorkspace = await services.workspace.create({ name: 'Bookings', scope: 'design' });
+    await services.environment.getOrCreateForParentId(sourceWorkspace._id);
+    await services.apiSpec.updateOrCreateForParentId(sourceWorkspace._id, {
+      contents: openApiContents,
+      contentType: 'yaml',
+      fileName: 'Bookings',
+    });
+
+    const { workspace } = await roundTrip(sourceWorkspace._id);
+    expect(workspace.scope).toBe('collection');
+
+    const importedSpec = await services.apiSpec.getByParentId(workspace._id);
+    expect(importedSpec).toBeTruthy();
+
+    // The spec must round-trip as the OpenAPI document only - it must NOT carry
+    // the Insomnia v5 envelope (type/schema_version/collection/meta).
+    expect(importedSpec?.contents).not.toContain('type: spec.insomnia.rest/5.0');
+    expect(importedSpec?.contents).not.toContain('schema_version');
+
+    const parsed = parse(importedSpec?.contents || '');
+    expect(parsed?.openapi).toBe('3.0.4');
+    expect(parsed?.info?.title).toBe('Bookings API');
+    expect(parsed?.paths?.['/bookings']).toBeTruthy();
+  });
+
+  it('preserves a collection with a folder and request', async () => {
+    const sourceWorkspace = await services.workspace.create({ name: 'My Collection', scope: 'collection' });
+    await services.environment.getOrCreateForParentId(sourceWorkspace._id);
+
+    const folder = await services.requestGroup.create({ name: 'Folder A', parentId: sourceWorkspace._id });
+    await services.request.create({
+      name: 'Create booking',
+      parentId: folder._id,
+      url: '{{ _.base_url }}/bookings',
+      method: 'POST',
+      body: { mimeType: 'application/json', text: '{"hello":"world"}' },
+    });
+
+    const { workspace } = await roundTrip(sourceWorkspace._id);
+    expect(workspace.scope).toBe('collection');
+
+    const folders = await services.requestGroup.findByParentId(workspace._id);
+    expect(folders.map(f => f.name)).toEqual(['Folder A']);
+
+    const requests = await services.request.findByParentId(folders[0]._id);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      name: 'Create booking',
+      url: '{{ _.base_url }}/bookings',
+      method: 'POST',
+      body: { mimeType: 'application/json', text: '{"hello":"world"}' },
+    });
+  });
+
+  it('preserves an environment workspace with sub-environment data', async () => {
+    const sourceWorkspace = await services.workspace.create({ name: 'Dev Environment', scope: 'environment' });
+    const baseEnv = await services.environment.getOrCreateForParentId(sourceWorkspace._id);
+    await services.environment.create({
+      name: 'Dev',
+      parentId: baseEnv._id,
+      data: { base_url: 'http://localhost:8000', auth_token: 'secret-token' },
+    });
+
+    const { workspace } = await roundTrip(sourceWorkspace._id);
+    expect(workspace.scope).toBe('environment');
+
+    const importedBase = await services.environment.getByParentId(workspace._id);
+    const subEnvs = await services.environment.listByParentId(importedBase!._id);
+    expect(subEnvs).toHaveLength(1);
+    expect(subEnvs[0].name).toBe('Dev');
+    expect(subEnvs[0].data).toEqual({ base_url: 'http://localhost:8000', auth_token: 'secret-token' });
+  });
+
+  it('preserves a mock server with its routes', async () => {
+    const sourceWorkspace = await services.workspace.create({ name: 'My Mock', scope: 'mock-server' });
+    await services.environment.getOrCreateForParentId(sourceWorkspace._id);
+    const mockServer = await services.mockServer.create({
+      name: 'My Mock',
+      parentId: sourceWorkspace._id,
+      url: 'http://localhost:8080',
+      useInsomniaCloud: false,
+    });
+    await services.mockRoute.create({
+      name: '/auth/login',
+      parentId: mockServer._id,
+      method: 'POST',
+      mimeType: 'application/json',
+      statusCode: 200,
+      body: '{"token":"abc"}',
+      headers: [{ name: 'Content-Type', value: 'application/json' }],
+    });
+
+    const { workspace } = await roundTrip(sourceWorkspace._id);
+    expect(workspace.scope).toBe('mock-server');
+
+    const importedServer = await services.mockServer.getByParentId(workspace._id);
+    expect(importedServer).toMatchObject({ url: 'http://localhost:8080', useInsomniaCloud: false });
+
+    const routes = await services.mockRoute.findByParentId(importedServer!._id);
+    expect(routes).toHaveLength(1);
+    expect(routes[0]).toMatchObject({
+      name: '/auth/login',
+      method: 'POST',
+      statusCode: 200,
+      body: '{"token":"abc"}',
+    });
+  });
+
+  it('preserves an MCP client request', async () => {
+    const sourceWorkspace = await services.workspace.create({ name: 'My MCP', scope: 'mcp' });
+    await services.environment.getOrCreateForParentId(sourceWorkspace._id);
+    await services.mcpRequest.create({
+      name: 'MCP',
+      parentId: sourceWorkspace._id,
+      url: 'https://example.com/mcp',
+      transportType: 'streamable-http',
+      headers: [{ name: 'User-Agent', value: 'insomnia' }],
+    });
+
+    const { workspace } = await roundTrip(sourceWorkspace._id);
+    expect(workspace.scope).toBe('mcp');
+
+    const importedRequest = await services.mcpRequest.getByParentId(workspace._id);
+    expect(importedRequest).toMatchObject({
+      url: 'https://example.com/mcp',
+      transportType: 'streamable-http',
+      headers: [{ name: 'User-Agent', value: 'insomnia' }],
+    });
+  });
+});
+
+describe('MCP run deep-link import', () => {
+  const mcpUrl = 'https://mcp.deepwiki.com/mcp';
+
+  it('imports an MCP url into an MCP workspace and exposes its client', async () => {
+    const project = await services.project.create();
+    const scanResult = await importUtil.scanResources([
+      { contentStr: mcpUrlToInsomniaV5Yaml(mcpUrl), oriFileName: 'mcp' },
+    ]);
+
+    expect(scanResult[0].errors).toEqual([]);
+    expect(scanResult[0].mcpRequests).toHaveLength(1);
+    expect(scanResult[0].requests).toHaveLength(0);
+
+    const workspaces = await importUtil.importResourcesToProject({ projectId: project._id });
+    expect(workspaces).toHaveLength(1);
+    expect(workspaces[0].scope).toBe('mcp');
+
+    const requests = await services.helpers.findRequestByParentId(workspaces[0]._id);
+    expect(requests).toHaveLength(1);
+    expect(models.mcpRequest.isMcpRequest(requests[0])).toBe(true);
+    expect((requests[0] as McpRequest).url).toBe(mcpUrl);
+  });
+
+  it('findExistingImportedWorkspace returns the MCP client with the same URL', async () => {
+    const project = await services.project.create();
+    await importUtil.scanResources([{ contentStr: mcpUrlToInsomniaV5Yaml(mcpUrl), oriFileName: 'mcp' }]);
+    const [workspace] = await importUtil.importResourcesToProject({ projectId: project._id });
+    const existingRequest = await services.mcpRequest.getByParentId(workspace._id);
+    expect(existingRequest?.url).toBe(mcpUrl);
+
+    await importUtil.scanResources([{ contentStr: mcpUrlToInsomniaV5Yaml(mcpUrl), oriFileName: 'mcp' }]);
+    const match = await importUtil.findExistingImportedWorkspace(project._id);
+    expect(match).toEqual({
+      workspace: expect.objectContaining({ _id: workspace._id, scope: 'mcp' }),
+      model: expect.objectContaining({ _id: existingRequest?._id, url: mcpUrl }),
+    });
+  });
+
+  it('findExistingImportedWorkspace returns undefined for a different MCP URL', async () => {
+    const project = await services.project.create();
+    await importUtil.scanResources([{ contentStr: mcpUrlToInsomniaV5Yaml(mcpUrl), oriFileName: 'mcp' }]);
+    await importUtil.importResourcesToProject({ projectId: project._id });
+
+    await importUtil.scanResources([
+      { contentStr: mcpUrlToInsomniaV5Yaml('https://mcp.example.com/other'), oriFileName: 'mcp' },
+    ]);
+    const match = await importUtil.findExistingImportedWorkspace(project._id);
+    expect(match).toBeUndefined();
+  });
+});
+
+describe('requiresNewWorkspace()', () => {
+  const base = { errors: [] as string[] };
+
+  it('returns false for collection-only imports', () => {
+    expect(
+      importUtil.requiresNewWorkspace({
+        ...base,
+        workspaces: [{ scope: 'collection' } as any],
+      }),
+    ).toBe(false);
+  });
+
+  it('returns false for request-only imports without workspaces', () => {
+    expect(
+      importUtil.requiresNewWorkspace({
+        ...base,
+        requests: [{ _id: 'req_1' } as any],
+      }),
+    ).toBe(false);
+  });
+
+  it.each(['mock-server', 'environment', 'design', 'mcp'] as const)(
+    'returns true when a %s workspace is present',
+    scope => {
+      expect(
+        importUtil.requiresNewWorkspace({
+          ...base,
+          workspaces: [{ scope } as any],
+        }),
+      ).toBe(true);
+    },
+  );
+
+  it('returns true when any non-collection workspace is mixed with collections', () => {
+    expect(
+      importUtil.requiresNewWorkspace({
+        ...base,
+        workspaces: [{ scope: 'collection' } as any, { scope: 'environment' } as any],
+      }),
+    ).toBe(true);
+  });
+
+  it('returns true for OpenAPI / Swagger scan results', () => {
+    expect(
+      importUtil.requiresNewWorkspace({
+        ...base,
+        type: { id: 'openapi3' } as any,
+      }),
+    ).toBe(true);
+    expect(
+      importUtil.requiresNewWorkspace({
+        ...base,
+        apiSpecs: [{ _id: 'spc_1' } as any],
+      }),
+    ).toBe(true);
+  });
+
+  it('returns true when mcpRequests are present', () => {
+    expect(
+      importUtil.requiresNewWorkspace({
+        ...base,
+        mcpRequests: [{ _id: 'mcp_1' } as any],
+      }),
+    ).toBe(true);
+  });
+
+  it('returns true for Postman environment scan results', () => {
+    expect(
+      importUtil.requiresNewWorkspace({
+        ...base,
+        type: { id: 'postman-environment' } as any,
+        environments: [{ _id: '__ENV_1__' } as any],
+      }),
+    ).toBe(true);
+  });
+});
+
+describe('sanitizeGitFileNameSegment', () => {
+  it('leaves an ordinary name untouched', () => {
+    expect(importUtil.sanitizeGitFileNameSegment('My API')).toBe('My API');
+  });
+
+  // Regression: gitFilePath (built as `${sanitizeGitFileNameSegment(name)}-${id}.yaml`)
+  // is later joined onto a git repo's working directory by repo-file-watcher.ts
+  // and git-repo-migration.ts. A workspace/collection name straight from an
+  // imported file (Insomnia export, Postman collection, OpenAPI info.title)
+  // must never be able to inject a path separator or traversal sequence into
+  // that joined path.
+  it('strips path separators', () => {
+    expect(importUtil.sanitizeGitFileNameSegment('some-dir/name')).not.toContain('/');
+    expect(importUtil.sanitizeGitFileNameSegment('some-dir\\name')).not.toContain('\\');
+  });
+
+  it('neutralizes traversal sequences', () => {
+    expect(importUtil.sanitizeGitFileNameSegment('../../../some/other/path')).not.toContain('..');
+  });
+
+  it('strips null bytes', () => {
+    expect(importUtil.sanitizeGitFileNameSegment('some\0name')).not.toContain('\0');
+  });
+
+  it('falls back to a default name when nothing remains', () => {
+    expect(importUtil.sanitizeGitFileNameSegment('')).toBe('workspace');
+    expect(importUtil.sanitizeGitFileNameSegment('   ')).toBe('workspace');
+  });
+});
