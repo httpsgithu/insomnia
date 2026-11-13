@@ -1,0 +1,115 @@
+import type { GitRepository } from 'insomnia-data';
+import { useEffect, useRef } from 'react';
+import { OverlayContainer } from 'react-aria';
+import { useParams } from 'react-router';
+
+import { useGitProjectResetActionFetcher } from '~/routes/git.reset';
+import { GitConnectionInfo } from '~/ui/components/git/connection-info';
+import { useGitCredentials } from '~/ui/hooks/use-git-credentials';
+import { resolveGitRepoBaseDir } from '~/ui/utils/git-repo-path';
+
+import { docsGitSync } from '../../../../common/documentation';
+import { Link } from '../../base/link';
+import { Modal, type ModalHandle, type ModalProps } from '../../base/modal';
+import { ModalBody } from '../../base/modal-body';
+import { ModalFooter } from '../../base/modal-footer';
+import { ModalHeader } from '../../base/modal-header';
+import { HelpTooltip } from '../../help-tooltip';
+
+export const GitRepositorySettingsModal = ({
+  gitRepository,
+  ...modalProps
+}: ModalProps & {
+  gitRepository: GitRepository;
+}) => {
+  const { credentials, providers } = useGitCredentials();
+
+  const selectedCredential = credentials.find(c => c._id === gitRepository.credentialsId);
+  const selectedProvider = providers.find(p => p.type === selectedCredential?.provider);
+
+  const { projectId, workspaceId } = useParams() as {
+    projectId: string;
+    workspaceId: string;
+  };
+
+  const modalRef = useRef<ModalHandle>(null);
+  const resetGitRepositoryFetcher = useGitProjectResetActionFetcher();
+
+  useEffect(() => {
+    modalRef.current?.show();
+  }, []);
+
+  const authorEmail = gitRepository.selectedAuthorEmail || selectedCredential?.author?.email;
+  const repoBaseDir = resolveGitRepoBaseDir(gitRepository);
+
+  return (
+    <OverlayContainer>
+      <Modal ref={modalRef} {...modalProps}>
+        <ModalHeader>
+          Git repository information{' '}
+          <HelpTooltip>
+            Sync and collaborate with Git
+            <br />
+            <Link href={docsGitSync}>Documentation {<i className="fa fa-external-link-square" />}</Link>
+          </HelpTooltip>
+        </ModalHeader>
+        <ModalBody>
+          {selectedProvider && (
+            <GitConnectionInfo
+              gitRepository={gitRepository}
+              providerInfo={selectedProvider}
+              authorName={selectedCredential?.author?.name || selectedCredential?.author?.email}
+            />
+          )}
+          {authorEmail && (
+            <div className="mt-4 flex text-[12px]">
+              <div className="w-27.5 font-semibold">Author Email</div>
+              <div>{authorEmail}</div>
+            </div>
+          )}
+          <div className="mt-4 flex items-start text-[12px]">
+            <div className="w-27.5 font-semibold">Local folder</div>
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <span className="min-w-0 flex-1 break-all">{repoBaseDir}</span>
+              <button
+                type="button"
+                className="btn btn--super-compact btn--outlined"
+                onClick={() => window.shell.showItemInFolder(repoBaseDir)}
+              >
+                Reveal
+              </button>
+            </div>
+          </div>
+        </ModalBody>
+        <ModalFooter>
+          <div
+            style={{
+              display: 'flex',
+              gap: 'var(--padding-md)',
+            }}
+          >
+            <button
+              className="btn"
+              onClick={() => {
+                resetGitRepositoryFetcher.submit({
+                  projectId,
+                  workspaceId,
+                });
+              }}
+            >
+              Disconnect git repository
+            </button>
+            <button
+              type="button"
+              onClick={() => modalRef.current?.hide()}
+              className="btn"
+              data-testid="git-repository-settings-modal__sync-btn-close"
+            >
+              Close
+            </button>
+          </div>
+        </ModalFooter>
+      </Modal>
+    </OverlayContainer>
+  );
+};

@@ -1,0 +1,109 @@
+import type { Request } from 'insomnia-data';
+import React, { useEffect, useRef, useState } from 'react';
+import { OverlayContainer } from 'react-aria';
+
+import { CodeEditor } from '~/ui/components/.client/codemirror/code-editor';
+
+import { Modal, type ModalHandle, type ModalProps } from '../base/modal';
+import { ModalBody } from '../base/modal-body';
+import { ModalFooter } from '../base/modal-footer';
+import { ModalHeader } from '../base/modal-header';
+
+export const PasteCurlModal = ({
+  onHide,
+  onImport,
+  defaultValue,
+}: ModalProps & { onImport: (req: Partial<Request>) => void; defaultValue?: string }) => {
+  const modalRef = useRef<ModalHandle>(null);
+  const [isValid, setIsValid] = useState<boolean>(true);
+  const [req, setReq] = useState<any>({});
+
+  useEffect(() => {
+    async function parseCurlToRequest() {
+      try {
+        const { data } = await window.main.parseImport(
+          {
+            contentStr: defaultValue || '',
+          },
+          {
+            importerId: 'curl',
+          },
+        );
+        const { resources } = data;
+        const importedRequest = resources[0];
+        setIsValid(true);
+        setReq(importedRequest);
+      } catch (error) {
+        console.log('[importer] error', error);
+        setIsValid(false);
+        setReq({});
+      } finally {
+        modalRef.current?.show();
+      }
+    }
+    parseCurlToRequest();
+  }, [defaultValue]);
+
+  return (
+    <OverlayContainer onClick={e => e.stopPropagation()}>
+      <Modal ref={modalRef} tall onHide={onHide}>
+        <ModalHeader>Paste Curl to import request</ModalHeader>
+        <ModalBody className="">
+          <CodeEditor
+            id="paste-curl-content"
+            placeholder="Paste curl request here"
+            className="border-top"
+            mode="text"
+            dynamicHeight
+            defaultValue={defaultValue}
+            onChange={async value => {
+              if (!value) {
+                setIsValid(false);
+                setReq({});
+                return;
+              }
+              try {
+                const { data } = await window.main.parseImport(
+                  {
+                    contentStr: value,
+                  },
+                  {
+                    importerId: 'curl',
+                  },
+                );
+                const { resources } = data;
+                const importedRequest = resources[0];
+                setIsValid(true);
+                setReq(importedRequest);
+              } catch (error) {
+                console.log('[importer] error', error);
+                setIsValid(false);
+                setReq({});
+              }
+            }}
+          />
+        </ModalBody>
+        <ModalFooter>
+          <div className="margin-left txt-sm truncate italic">
+            {isValid ? `Detected ${req.method} request to ${req.url}` : 'Invalid input'}
+          </div>
+          <div>
+            <button className="btn" onClick={() => modalRef.current?.hide()}>
+              Cancel
+            </button>
+            <button
+              className="btn"
+              onClick={() => {
+                onImport(req);
+                modalRef.current?.hide();
+              }}
+              disabled={!isValid}
+            >
+              Import
+            </button>
+          </div>
+        </ModalFooter>
+      </Modal>
+    </OverlayContainer>
+  );
+};

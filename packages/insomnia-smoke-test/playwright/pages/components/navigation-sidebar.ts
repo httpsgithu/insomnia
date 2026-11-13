@@ -1,0 +1,343 @@
+import { expect, type Locator, type Page } from '@playwright/test';
+
+/**
+ * Page object for the **project navigation sidebar** (left-side tree).
+ */
+export class NavigationSidebar {
+  constructor(readonly page: Page) {}
+
+  get root(): Locator {
+    return this.page.getByTestId('global-navigation-sidebar');
+  }
+
+  get navigationTree(): Locator {
+    return this.root.getByLabel('Project Navigation Tree');
+  }
+
+  // ===========================================================================
+  // Organization switching
+  // ===========================================================================
+
+  async selectOrganization(name: string): Promise<void> {
+    await this.page.getByRole('button', { name: 'Organizations' }).click();
+    await this.page.getByRole('option', { name }).click();
+  }
+
+  async openControlPlanesOrganization(): Promise<void> {
+    await this.selectOrganization('Control Planes');
+  }
+
+  // ===========================================================================
+  // Filter input
+  // ===========================================================================
+
+  get filterInput(): Locator {
+    return this.root.getByLabel('Projects filter');
+  }
+
+  async fillFilter(text: string): Promise<void> {
+    await this.filterInput.fill(text);
+  }
+
+  async clearFilter(): Promise<void> {
+    await this.root.getByRole('button', { name: 'Clear search' }).click();
+  }
+
+  // ===========================================================================
+  // Project nodes
+  // ===========================================================================
+
+  async clickNewProject(): Promise<void> {
+    await this.root.getByLabel('Create new Project').click();
+  }
+
+  projectRow(projectName: string): Locator {
+    return this.navigationTree.getByTestId(`project-node-${projectName}`);
+  }
+
+  async selectProject(projectName: string): Promise<void> {
+    await this.projectRow(projectName).click();
+  }
+
+  async openProjectActionsDropdown(projectName: string): Promise<void> {
+    const projectRow = this.projectRow(projectName);
+    await projectRow.hover();
+    await projectRow.getByLabel('Project Actions').click();
+  }
+
+  async selectProjectDropdownOption({
+    actionName,
+    projectName,
+  }: {
+    actionName: string;
+    projectName: string;
+  }): Promise<void> {
+    await this.openProjectActionsDropdown(projectName);
+    await this.page.getByRole('menuitemradio', { name: actionName }).click();
+  }
+
+  async expandProject(projectName: string): Promise<void> {
+    await this.projectRow(projectName).getByLabel(`Expand ${projectName}`).click();
+  }
+
+  async collapseProject(projectName: string): Promise<void> {
+    await this.projectRow(projectName).getByLabel(`Collapse ${projectName}`).click();
+  }
+
+  // ===========================================================================
+  // Workspace nodes
+  // ===========================================================================
+  workspaceRow(workspaceName: string): Locator {
+    return this.root.getByTestId(`workspace-node-${workspaceName}`);
+  }
+
+  workspaceGridListItem(workspaceName: string): Locator {
+    return this.navigationTree.getByRole('row', { name: workspaceName });
+  }
+
+  // Focus mode swaps the collection's tree row for a header at the top of the sidebar carrying the
+  // back arrow and the collection's name — that header is the only title the sidebar shows for the
+  // active collection. Waiting for it also absorbs the window right after navigating in, where the
+  // tree is still rendered and the swap hasn't happened yet. Both assertions re-query on every
+  // retry, so the swap unmounting the tree row can't wedge them, as a single locator query would
+  // (it keeps waiting for its selector to match again, which never happens once focus mode is in).
+  async expectWorkspaceActive(workspaceName: string): Promise<void> {
+    await expect(this.root.getByLabel('Back to all projects')).toBeVisible();
+    await expect(this.root.getByTestId(`workspace-node-${workspaceName}`)).toContainText(workspaceName);
+  }
+
+  // Exits collection focus mode if currently focused; no-op otherwise. Needed before
+  // interacting with a different collection or project, since focus mode hides everything
+  // outside the focused collection.
+  async backToAllProjects(): Promise<void> {
+    const backButton = this.root.getByLabel('Back to all projects');
+    if (await backButton.isVisible().catch(() => false)) {
+      await backButton.click();
+    }
+  }
+
+  async selectWorkspace(workspaceName: string): Promise<void> {
+    await this.workspaceRow(workspaceName).click();
+  }
+
+  async openWorkspaceActionsDropdown(workspaceName: string): Promise<void> {
+    const workspaceRow = this.workspaceRow(workspaceName);
+    const actionsButton = workspaceRow.getByLabel('SideBar Workspace Actions');
+    // Sometimes the dropdown button can be a bit tricky to click if the hover state isn't properly triggered, so we'll add some retries here to make it more robust
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await workspaceRow.hover();
+      if (attempt > 0) {
+        console.log(`Retrying to open workspace actions dropdown for "${workspaceName}", attempt ${attempt + 1}`);
+      }
+      try {
+        await actionsButton.waitFor({ state: 'visible', timeout: 1000 });
+        break;
+      } catch {}
+    }
+    await actionsButton.click();
+  }
+
+  async selectWorkspaceDropdownOption({
+    actionName,
+    workspaceName,
+  }: {
+    actionName: string;
+    workspaceName: string;
+  }): Promise<void> {
+    await this.openWorkspaceActionsDropdown(workspaceName);
+    await this.page.getByRole('menuitemradio', { name: actionName, exact: true }).click();
+  }
+
+  async expandWorkspace(workspaceName: string): Promise<void> {
+    await this.workspaceRow(workspaceName).getByLabel(`Expand ${workspaceName}`).click();
+  }
+
+  async collapseWorkspace(workspaceName: string): Promise<void> {
+    await this.workspaceRow(workspaceName).getByLabel(`Collapse ${workspaceName}`).click();
+  }
+
+  async getWorkspaceParentName(workspaceName: string): Promise<string | null> {
+    const workspaceRow = this.workspaceRow(workspaceName);
+    const projectName = await workspaceRow.getAttribute('data-project');
+    return projectName;
+  }
+
+  // ===========================================================================
+  // Request / Request Group nodes
+  // ===========================================================================
+
+  requestRow(requestOrGroupName: string, workspaceName?: string): Locator {
+    if (workspaceName) {
+      // If workspaceName is provided, scope the locator to that workspace's subtree to avoid collisions between workspaces
+      return this.root
+        .getByTestId(`request-node-${requestOrGroupName}`)
+        .and(this.page.locator(`[data-workspace="${workspaceName}"]`));
+    }
+    return this.root.getByTestId(`request-node-${requestOrGroupName}`);
+  }
+
+  pinnedRequestRow(requestName: string): Locator {
+    return this.root.getByTestId(`pinned-request-node-${requestName}`);
+  }
+
+  async clickRequestOrFolder(requestOrGroupName: string, workspaceName?: string): Promise<void> {
+    const row = this.requestRow(requestOrGroupName, workspaceName);
+    await row.click();
+    await expect.soft(row).toHaveAttribute('data-selected', 'true');
+  }
+
+  async openRequestActionsDropdown(requestName: string, workspaceName?: string): Promise<void> {
+    const requestRow = this.requestRow(requestName, workspaceName);
+    const actionsButton = requestRow.getByLabel('Request Actions');
+    // Sometimes the dropdown button can be a bit tricky to click if the hover state isn't properly triggered, so we'll add some retries here to make it more robust
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await requestRow.hover();
+      if (attempt > 0) {
+        console.log(`Retrying to open request actions dropdown for "${requestName}", attempt ${attempt + 1}`);
+      }
+      try {
+        await actionsButton.waitFor({ state: 'visible', timeout: 1000 });
+        break;
+      } catch {}
+    }
+    await actionsButton.click();
+  }
+
+  async openRequestGroupActionsDropdown(requestName: string, workspaceName?: string): Promise<void> {
+    const requestRow = this.requestRow(requestName, workspaceName);
+    const actionsButton = requestRow.getByLabel('Request Group Actions');
+    // Sometimes the dropdown button can be a bit tricky to click if the hover state isn't properly triggered, so we'll add some retries here to make it more robust
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await requestRow.hover();
+      if (attempt > 0) {
+        console.log(`Retrying to open request group actions dropdown for "${requestName}", attempt ${attempt + 1}`);
+      }
+      try {
+        await actionsButton.waitFor({ state: 'visible', timeout: 1000 });
+        break;
+      } catch {}
+    }
+    await actionsButton.click();
+  }
+
+  async selectRequestDropdownOption({
+    actionName,
+    requestName,
+    workspaceName,
+  }: {
+    actionName: string;
+    requestName: string;
+    workspaceName?: string;
+  }): Promise<void> {
+    await this.openRequestActionsDropdown(requestName, workspaceName);
+    await this.page.getByRole('menuitemradio', { name: actionName }).click();
+  }
+
+  async selectRequestGroupDropdownOption({
+    actionName,
+    requestGroupName,
+    workspaceName,
+  }: {
+    actionName: string;
+    requestGroupName: string;
+    workspaceName?: string;
+  }): Promise<void> {
+    await this.openRequestGroupActionsDropdown(requestGroupName, workspaceName);
+    await this.page.getByRole('menuitemradio', { name: actionName }).click();
+  }
+
+  async renameRequestOrFolder(requestName: string, newName: string, workspaceName?: string): Promise<void> {
+    const row = this.requestRow(requestName, workspaceName);
+    await row.dblclick();
+    const input = row.getByRole('textbox');
+    await input.fill(newName);
+    await input.press('Enter');
+    await this.requestRow(newName, workspaceName).waitFor({ state: 'visible' });
+  }
+
+  async isRequestOrGroupSelected(requestOrGroupName: string): Promise<boolean> {
+    const row = this.requestRow(requestOrGroupName);
+    return (await row.getAttribute('data-selected')) === 'true';
+  }
+
+  async pinRequest(requestName: string): Promise<void> {
+    await this.openRequestActionsDropdown(requestName);
+    await this.page.getByRole('menuitemradio', { name: 'Pin' }).click();
+  }
+
+  async unpinRequest(requestName: string): Promise<void> {
+    const requestRow = this.requestRow(requestName);
+    await requestRow.hover();
+    await requestRow.getByLabel('Unpin request').click();
+  }
+
+  async expandFolder(folderName: string): Promise<void> {
+    await this.root.getByLabel(`Expand ${folderName}`).click();
+  }
+
+  async collapseFolder(folderName: string): Promise<void> {
+    await this.root.getByLabel(`Collapse ${folderName}`).click();
+  }
+
+  // ===========================================================================
+  // Unsynced workspace nodes
+  // ===========================================================================
+
+  unsyncedWorkspaceRow(workspaceName: string): Locator {
+    return this.root.getByTestId(`unsynced-workspace-node-${workspaceName}`);
+  }
+
+  unsyncedWorkspaceButton(workspaceName: string): Locator {
+    return this.unsyncedWorkspaceRow(workspaceName).getByRole('button', { name: 'Fetch unsynced workspace' });
+  }
+
+  async fetchUnsyncedWorkspace(name: string, verifyVisible?: Locator): Promise<void> {
+    const unsyncedWorkspaceButton = this.unsyncedWorkspaceButton(name);
+    await unsyncedWorkspaceButton.click();
+    await this.page.mouse.move(0, 0);
+    await expect.soft(this.unsyncedWorkspaceRow(name)).toBeHidden({ timeout: 5000 });
+    await expect.soft(this.workspaceRow(name)).toBeVisible();
+    // The sidebar list is still settling right after the unsynced row disappears
+    // Retry the click itself rather than only polling the assertion afterward.
+    const gridListItem = this.workspaceGridListItem(name);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await this.workspaceRow(name).click();
+      try {
+        await expect(gridListItem).toHaveAttribute('aria-selected', 'true', { timeout: 1000 });
+        break;
+      } catch {
+        if (attempt === 2) {
+          console.warn(`Clicking workspace row "${name}" did not select it after 3 attempts`);
+          throw new Error(`Clicking workspace row "${name}" did not select it after 3 attempts`);
+        }
+      }
+    }
+    if (!verifyVisible) {
+      return;
+    }
+    for (let attempt = 0; attempt <= 10; attempt++) {
+      try {
+        await verifyVisible.waitFor({ state: 'visible', timeout: 1000 });
+        return;
+      } catch {
+        if (attempt === 10) {
+          throw new Error(`Workspace "${name}" was selected but its content did not render after 10 attempts`);
+        }
+        await this.workspaceRow(name).click();
+      }
+    }
+  }
+
+  // ===========================================================================
+  // Empty-state nodes (emptyProject / emptyCollection / emptyFolder)
+  // ===========================================================================
+
+  async openEmptyNodeCreateMenu(): Promise<void> {
+    await this.root.getByLabel('Create in project').click();
+  }
+
+  async selectCreateAction(actionName: string): Promise<void> {
+    await this.openEmptyNodeCreateMenu();
+    await this.page.getByRole('menuitem', { name: actionName }).click();
+  }
+}
